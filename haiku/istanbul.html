@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>İstanbul Boğazı · Gün Batımı</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #03050f; }
+  canvas#sahne { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; cursor: pointer; }
+  #ipucu {
+    position: fixed; left: 28px; bottom: 22px; margin: 0;
+    font: 14px/1.4 Georgia, 'Times New Roman', serif; letter-spacing: .05em;
+    color: rgba(255, 238, 214, .7); text-shadow: 0 0 8px rgba(0, 0, 0, .6);
+    transition: opacity 2.5s ease; pointer-events: none; user-select: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="sahne"></canvas>
+<p id="ipucu">R · baştan başlat</p>
+<script>
+(() => {
+'use strict';
+
+/* ---------- ayarlar ---------- */
+// Altın saat → tam gece arasındaki süre (saniye). Örn. ?sure=30 ile hızlı önizleme.
+const DURATION = Math.max(10, parseFloat(new URLSearchParams(location.search).get('sure')) || 240);
+
+const canvas = document.getElementById('sahne');
+const ctx = canvas.getContext('2d');
+const shore = document.createElement('canvas');   // kıyı + köprü katmanı (yansıma için ayrı tutulur)
+const sctx = shore.getContext('2d');
+const hint = document.getElementById('ipucu');
+
+const WIN = ['rgb(255,214,142)', 'rgb(255,186,104)', 'rgb(236,244,255)'];
+
+/* ---------- yardımcılar ---------- */
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const wrap = (v, m) => ((v % m) + m) % m;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const hex = h => { const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; };
+const mixc = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+const rgba = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+const hill = (u, c, w, a) => a * Math.exp(-(((u - c) / w) ** 2));
+
+function rng(seed) {                 // sabit tohumlu rastgelelik: şehir her boyutta aynı görünür
+  return function () {
+    seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- gökyüzü paleti (gün batımı → gece) ---------- */
+const SKY = [
+  [0.00, '#3f6fae', '#e7a06f', '#fcd9a0'],
+  [0.26, '#34588f', '#e9845a', '#f6a25f'],
+  [0.50, '#3f3572', '#c4537a', '#ef6f4c'],
+  [0.70, '#1f2456', '#7a3a6c', '#c45a5c'],
+  [0.86, '#0c1233', '#2a2c5c', '#5a3b66'],
+  [1.00, '#03050f', '#0a1027', '#18223d'],
+].map(([p, a, b, c]) => ({ p, top: hex(a), mid: hex(b), low: hex(c) }));
+
+function skyAt(p) {
+  let i = 0;
+  while (i < SKY.length - 2 && p > SKY[i + 1].p) i++;
+  const A = SKY[i], B = SKY[i + 1];
+  const t = smooth(A.p, B.p, p);
+  return { top: mixc(A.top, B.top, t), mid: mixc(A.mid, B.mid, t), low: mixc(A.low, B.low, t) };
+}
+
+// alt: güneşin su çizgisinin (H oranında) üstündeki yüksekliği; x: yatay konum (W oranında)
+const sunAt = p => ({ alt: lerp(0.47, -0.08, smooth(0, 0.9, p)), x: lerp(0.58, 0.5, p) });
+
+/* ---------- durum ---------- */
+let W, H, S, dpr, waterY;
+let t0 = performance.now();
+const F = { t: 0, p: 0, aN: 0, nite: 0, sunVis: 0, redA: 0 };   // aN: pencere ışıkları, nite: gece, sunVis: güneş ufukta
+let blocks = [], windows = [], marks = [], clouds = [], birds = [], glints = [], ripples = [], stars = [];
+let halos = [];
+
+/* ---------- geometri ---------- */
+function elevPx(u) {                 // kıyının su seviyesinden yüksekliği (px); u = x / W
+  const e = u < 0.5
+    ? hill(u, 0.20, 0.15, 0.30) + hill(u, 0.34, 0.07, 0.13) + hill(u, 0.05, 0.05, 0.07) + hill(u, 0.47, 0.05, 0.05)
+    : hill(u, 0.86, 0.12, 0.25) + hill(u, 0.70, 0.06, 0.09) + hill(u, 0.97, 0.04, 0.06) + hill(u, 0.60, 0.05, 0.04);
+  return Math.max(0, H * (e + 0.006 * Math.sin(u * 120 + 1.3)));
+}
+const gy = x => waterY - elevPx(x / W);   // x (px) → zemin y
+
+function bridgeGeom() {             // Boğaz Köprüsü: güverte, kuleler, ana kablo
+  const deck = waterY - 0.19 * H, top = deck - 0.17 * H;
+  return { x0: W * 0.41, x1: W * 0.80, deck, top, t1: W * 0.53, t2: W * 0.70, sag: deck - 0.035 * H };
+}
+
+/* ---------- dünya kurulumu (boyutlandırmada yeniden) ---------- */
+function bank(x0, x1, R) {          // evler: sadece silüet kutuları + ışıklı pencereler
+  for (let x = x0; x < x1;) {
+    const bw = (5 + R() * 11) * S;
+    const e = elevPx((x + bw / 2) / W);
+    const g = waterY - e;
+    const bh = (4 + R() * 12) * S * (R() < 0.12 ? 2 : 1) + e * 0.16;
+    const top = g - bh;
+    if (R() > 0.12) {
+      blocks.push([x, top, bw + 0.5, bh + 2]);
+      if (bh > 12 * S) {
+        for (let wy = top + 4 * S; wy < g - 3 * S; wy += 6 * S)
+          for (let wx = x + 2 * S; wx < x + bw - 2 * S; wx += 4.2 * S)
+            if (R() < 0.5) windows.push({
+              x: wx, y: wy, w: Math.max(1.5, 1.8 * S), h: Math.max(1.8, 2.6 * S),
+              thr: 0.5 + R() * 0.47, c: WIN[(R() * 3) | 0]
+            });
+      }
+    }
+    x += bw;
+  }
+}
+
+function build() {
+  const R = rng(7);
+  blocks = []; windows = []; marks = []; clouds = []; birds = []; glints = []; ripples = []; stars = [];
+
+  bank(0, W * 0.47, R);             // Avrupa yakası (solda)
+  bank(W * 0.5, W, R);              // Asya yakası (sağda)
+
+  const at = u => ({ x: u * W, base: gy(u * W) });
+  marks.push({ type: 'mosque', ...at(0.12), r: 40 * S, n: 4 });   // Sultanahmet silüeti
+  const gal = { type: 'galata', ...at(0.29), h: H * 0.2 };         // Galata Kulesi
+  marks.push(gal);
+  for (let y = gal.base - gal.h * 0.74; y < gal.base - 6 * S; y += 8 * S)
+    for (const k of [-0.22, 0.22]) windows.push({
+      x: gal.x + k * gal.h * 0.18 - 0.9 * S, y, w: 1.8 * S, h: 2.6 * S, thr: 0.5 + R() * 0.47, c: WIN[0]
+    });
+  marks.push({ type: 'mosque', ...at(0.455), r: 15 * S, n: 2 });  // Ortaköy
+  marks.push({ type: 'mosque', ...at(0.745), r: 22 * S, n: 2 });  // Beylerbeyi yakını
+  marks.push({ type: 'mosque', ...at(0.91), r: 34 * S, n: 4 });   // Asya yakası tepe camisi
+
+  for (let i = 0; i < 9; i++) {
+    const blobs = [];
+    for (let k = 0; k < 9; k++) blobs.push({ dx: R() - 0.5, dy: (R() - 0.5) * 0.6, r: 0.5 + R() * 0.6 });
+    clouds.push({
+      x0: R() * W, y: H * (0.08 + R() * 0.38), len: (200 + R() * 260) * S, hgt: (22 + R() * 30) * S,
+      v: (3 + R() * 6) * S * (R() < 0.5 ? 1 : -1), blobs
+    });
+  }
+  for (let i = 0; i < 420; i++) stars.push({ x: R(), y: R() * 0.72, r: R() < 0.04 ? 1.5 : 0.5 + R() * 0.7, ph: R() * 6.28, sp: 0.6 + R() * 1.8 });
+  for (let i = 0; i < 16; i++) birds.push({
+    x0: R() * W, y: H * (0.1 + R() * 0.32), v: (22 + R() * 34) * S * (R() < 0.8 ? 1 : -1),
+    s: (6 + R() * 6) * S, ph: R() * 6.28, fr: 4 + R() * 3, bob: R() * 6.28
+  });
+  for (let i = 0; i < 280; i++) glints.push({ d: Math.pow(R(), 1.3), o: R() * 2 - 1, ph: R() * 6.28, sp: 1.5 + R() * 3.5 });
+  for (let i = 0; i < 320; i++) ripples.push({ d: R(), x: R(), len: 0.4 + R() * 1.2, ph: R() * 6.28, sp: 0.2 + R() * 0.5 });
+}
+
+/* ---------- çizim: silüetler ---------- */
+function drawGalata(x, base, h, col) {
+  const w = h * 0.18, top = base - h, c = sctx;
+  c.fillStyle = col;
+  c.fillRect(x - w * 0.42, top + h * 0.2, w * 0.84, base - top - h * 0.2 + 2);      // silindirik gövde
+  c.fillRect(x - w * 0.56, top + h * 0.19, w * 1.12, Math.max(2, h * 0.03));        // galeri
+  c.beginPath();                                                                   // konik külah
+  c.moveTo(x - w * 0.6, top + h * 0.19); c.lineTo(x, top); c.lineTo(x + w * 0.6, top + h * 0.19);
+  c.closePath(); c.fill();
+  c.fillRect(x - S * 0.6, top - h * 0.05, S * 1.2, h * 0.05);
+  halos.push({ x, y: top - h * 0.02, r: 14 * S, c: '255,205,140', a: 0.8, n: true });
+}
+
+function drawMinaret(x, base, h, w, col) {
+  const c = sctx, top = base - h;
+  c.fillStyle = col;
+  c.beginPath();
+  c.moveTo(x - w * 0.5, base); c.lineTo(x - w * 0.34, top + h * 0.14);
+  c.lineTo(x + w * 0.34, top + h * 0.14); c.lineTo(x + w * 0.5, base);
+  c.fill();
+  c.fillRect(x - w * 0.7, top + h * 0.3, w * 1.4, Math.max(1, w * 0.28));           // şerefeler
+  c.fillRect(x - w * 0.7, top + h * 0.55, w * 1.4, Math.max(1, w * 0.28));
+  c.beginPath();                                                                   // külah
+  c.moveTo(x - w * 0.42, top + h * 0.14); c.lineTo(x, top); c.lineTo(x + w * 0.42, top + h * 0.14);
+  c.fill();
+  c.fillRect(x - 0.4, top - h * 0.06, 0.8, h * 0.06);
+  halos.push({ x, y: top - h * 0.03, r: 8 * S, c: '255,210,140', a: 0.75, n: true });
+}
+
+function drawMosque(cx, base, r, n, col) {
+  const c = sctx, hall = base - r * 0.95;
+  c.fillStyle = col;
+  c.beginPath(); c.ellipse(cx, hall, r, r * 0.8, 0, Math.PI, 2 * Math.PI); c.fill();          // ana kubbe
+  c.fillRect(cx - r * 1.3, hall, r * 2.6, base - hall + 2);                                    // gövde
+  for (const s of [-1, 1]) {                                                                   // yarım kubbeler
+    c.beginPath(); c.ellipse(cx + s * r * 0.95, hall + r * 0.25, r * 0.5, r * 0.42, 0, Math.PI, 2 * Math.PI); c.fill();
+  }
+  const sides = n === 4 ? [[-1.75, 3.2], [1.75, 3.2], [-3, 2.8], [3, 2.8]] : [[-1.75, 3.2], [1.75, 3.2]];
+  for (const [o, k] of sides) drawMinaret(cx + o * r, base + 6 * S, k * r, Math.max(2, r * 0.17), col);
+}
+
+function drawBridge(col, t) {
+  const c = sctx, B = bridgeGeom(), tw = 5 * S;
+  c.fillStyle = col; c.strokeStyle = col;
+  c.lineWidth = 1.6 * S;
+  c.fillRect(B.x0, B.deck, B.x1 - B.x0, 3 * S);                                               // güverte
+  for (const x of [B.x0, B.x1]) c.fillRect(x - 2 * S, B.deck, 4 * S, Math.max(0, gy(x) - B.deck));  // ayaklar
+  const midC = 2 * B.sag - B.top;
+  c.beginPath();                                                                              // kablolar
+  c.moveTo(B.x0, B.deck); c.quadraticCurveTo(B.t1 - (B.t1 - B.x0) * 0.3, B.deck, B.t1, B.top);
+  c.moveTo(B.t1, B.top); c.quadraticCurveTo((B.t1 + B.t2) / 2, midC, B.t2, B.top);
+  c.moveTo(B.t2, B.top); c.quadraticCurveTo(B.t2 + (B.x1 - B.t2) * 0.3, B.deck, B.x1, B.deck);
+  c.stroke();
+  c.lineWidth = 1 * S; c.beginPath();                                                         // askılar
+  for (let x = B.t1 + 9 * S; x < B.t2; x += 9 * S) {
+    const s = (x - B.t1) / (B.t2 - B.t1);
+    const y = (1 - s) * (1 - s) * B.top + 2 * (1 - s) * s * midC + s * s * B.top;
+    c.moveTo(x, y); c.lineTo(x, B.deck);
+  }
+  c.stroke();
+  for (const tx of [B.t1, B.t2]) {                                                            // kuleler
+    c.fillStyle = col;
+    c.fillRect(tx - tw / 2, B.top, tw, B.deck - B.top + 3 * S);
+    c.globalAlpha = F.redA; c.fillStyle = 'rgb(255,60,50)';
+    c.fillRect(tx - 1.5 * S, B.top - 3 * S, 3 * S, 3 * S);
+    c.globalAlpha = 1;
+    halos.push({ x: tx, y: B.top, r: 12 * S, c: '255,70,60', a: F.redA, n: false });
+  }
+  c.fillStyle = 'rgb(255,222,160)';                                                           // güverte ışıkları, tek tek
+  let i = 0;
+  for (let x = B.x0 + 6 * S; x < B.x1 - 4 * S; x += 7 * S, i++) {
+    const a = clamp((F.aN - (0.55 + 0.4 * ((i * 0.618) % 1))) / 0.05);
+    if (a > 0) { c.globalAlpha = a; c.fillRect(x, B.deck - 3 * S, 2.2 * S, 2.2 * S); }
+  }
+  c.globalAlpha = 1;
+  c.fillStyle = col;
+}
+
+function drawShore(t, sky) {
+  const c = sctx;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, W, H);
+  const sil = mixc(sky.low, [3, 4, 12], 0.86);
+  const far = mixc(sky.low, [22, 18, 44], 0.55);
+
+  c.fillStyle = rgba(far);                                                                    // uzak sırtlar
+  c.beginPath(); c.moveTo(0, waterY);
+  for (let x = 0; x <= W + 8; x += 8) {
+    const u = x / W;
+    c.lineTo(x, waterY - H * (0.05 + 0.07 * hill(u, 0.25, 0.3, 1) + 0.08 * hill(u, 0.8, 0.22, 1) + 0.015 * Math.sin(u * 40)));
+  }
+  c.lineTo(W, waterY); c.closePath(); c.fill();
+
+  c.fillStyle = rgba(sil);                                                                    // kıyılar
+  for (const [a, b] of [[0, W * 0.5], [W * 0.5, W]]) {
+    c.beginPath(); c.moveTo(a, waterY);
+    for (let x = a; x <= b; x += 5) c.lineTo(x, gy(x));
+    c.lineTo(b, waterY); c.closePath(); c.fill();
+  }
+  c.fillStyle = rgba(sil);
+  for (const b of blocks) c.fillRect(b[0], b[1], b[2], b[3]);
+  for (const m of marks) {
+    if (m.type === 'galata') drawGalata(m.x, m.base, m.h, sil);
+    else drawMosque(m.x, m.base, m.r, m.n, sil);
+  }
+  drawBridge(sil, t);
+
+  for (const w of windows) {                                                                  // pencereler tek tek yanar
+    if (F.aN <= w.thr) continue;
+    c.globalAlpha = clamp((F.aN - w.thr) / 0.06);
+    c.fillStyle = w.c;
+    c.fillRect(w.x, w.y, w.w, w.h);
+  }
+  c.globalAlpha = 1;
+}
+
+/* ---------- çizim: gökyüzü, bulutlar, su ---------- */
+function drawSky(sky, sunX, sunY, alt, t) {
+  const g = ctx.createLinearGradient(0, 0, 0, waterY);
+  g.addColorStop(0, rgba(sky.top));
+  g.addColorStop(0.55, rgba(sky.mid));
+  g.addColorStop(1, rgba(sky.low));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, waterY + 2);
+
+  const starA = smooth(0.8, 1, F.p);
+  if (starA > 0) for (const s of stars) {
+    ctx.fillStyle = `rgba(240,242,255,${clamp(starA * (0.4 + 0.6 * Math.sin(t * s.sp + s.ph)))})`;
+    ctx.fillRect(s.x * W, s.y * H, s.r * S, s.r * S);
+  }
+
+  const glowA = (0.35 + 0.65 * F.sunVis) * (1 - 0.8 * F.nite);
+  const gg = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, H * 0.7);
+  gg.addColorStop(0, `rgba(255,236,196,${0.75 * glowA})`);
+  gg.addColorStop(0.07, `rgba(255,200,130,${0.4 * glowA})`);
+  gg.addColorStop(0.3, `rgba(255,130,90,${0.1 * glowA})`);
+  gg.addColorStop(1, 'rgba(255,120,80,0)');
+  ctx.fillStyle = gg;
+  ctx.fillRect(0, 0, W, waterY);
+
+  if (alt > -0.03) {
+    const r = H * 0.03;
+    ctx.save();
+    ctx.globalAlpha = smooth(-0.03, 0.04, alt);
+    const dg = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, r);
+    dg.addColorStop(0, '#fff8ea'); dg.addColorStop(0.75, '#ffe3a8'); dg.addColorStop(1, '#ffc57a');
+    ctx.fillStyle = dg;
+    ctx.beginPath(); ctx.arc(sunX, sunY, r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawClouds(t, sky) {
+  const lit = mixc(sky.low, [255, 236, 214], 0.45), dark = mixc(sky.top, [5, 6, 16], 0.5);
+  const col = mixc(dark, lit, clamp(F.sunVis * 0.85 + (1 - F.nite) * 0.15));
+  for (const c of clouds) {
+    const span = W + 2 * c.len;
+    const x = wrap(c.x0 + c.v * t + c.len, span) - c.len;
+    for (const b of c.blobs) {
+      const cx = x + b.dx * c.len, cy = c.y + b.dy * c.hgt, r = b.r * c.hgt * 1.5;
+      const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+      g.addColorStop(0, rgba(col, 0.42)); g.addColorStop(1, rgba(col, 0));
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+
+function drawWater(sky) {
+  const g = ctx.createLinearGradient(0, waterY, 0, H);
+  g.addColorStop(0, rgba(mixc(sky.mid, [0, 0, 0], 0.55)));
+  g.addColorStop(0.5, rgba(mixc(sky.mid, [2, 3, 10], 0.85)));
+  g.addColorStop(1, 'rgb(2,3,9)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, waterY, W, H - waterY);
+}
+
+function drawReflection(t) {                                                                  // kıyının dalgalı yansıması
+  const RH = Math.min(H - waterY, H * 0.3), step = 2;
+  for (let y = waterY; y < waterY + RH; y += step) {
+    const k = (y - waterY) / RH;
+    const src = 2 * waterY - y - step;
+    if (src < 0) break;
+    const dx = Math.sin(y * 0.11 + t * 1.5) * (1.5 + k * 4) * S;
+    ctx.globalAlpha = 0.5 * (1 - k * 0.8);
+    ctx.drawImage(shore, 0, src * dpr, W * dpr, step * dpr, dx, y, W, step);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawRipples(t, sky) {
+  ctx.strokeStyle = rgba(mixc(sky.low, [255, 240, 220], 0.35), 0.05 + 0.1 * F.sunVis + 0.05 * F.aN);
+  ctx.lineWidth = 1 * S;
+  ctx.beginPath();
+  for (const r of ripples) {
+    const y = waterY + 4 * S + Math.pow(r.d, 1.6) * (H - waterY - 4 * S);
+    const len = (4 + 26 * r.d) * r.len * S;
+    const x = wrap(r.x * W + Math.sin(t * r.sp + r.ph) * 6 * S, W);
+    ctx.moveTo(x, y); ctx.lineTo(x + len, y);
+  }
+  ctx.stroke();
+}
+
+function drawGlints(t, sunX) {                                                                // güneş yansıma yolu
+  if (F.sunVis < 0.02) return;
+  ctx.fillStyle = 'rgb(255,238,205)';
+  for (const g of glints) {
+    const y = waterY + 3 * S + Math.pow(g.d, 1.4) * (H - waterY);
+    const x = sunX + g.o * (0.012 + 0.12 * g.d) * W;
+    const a = F.sunVis * (0.5 + 0.5 * Math.sin(t * g.sp + g.ph)) * (1 - g.d * 0.6) * 0.9;
+    if (a < 0.03) continue;
+    const w = (2 + 9 * (1 - g.d)) * S;
+    ctx.globalAlpha = a;
+    ctx.fillRect(x - w / 2, y, w, Math.max(1, 1.4 * S * (1 - g.d * 0.5)));
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHaze(sky) {
+  const top = waterY - H * 0.07;
+  const g = ctx.createLinearGradient(0, top, 0, waterY + 4 * S);
+  g.addColorStop(0, rgba(sky.low, 0));
+  g.addColorStop(1, rgba(sky.low, 0.28));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, top, W, waterY + 4 * S - top);
+}
+
+/* ---------- çizim: vapur, martılar, ışık halesi, vinyet ---------- */
+function drawFerry(t) {
+  const fw = 130 * S, h = 24 * S, c = ctx;
+  const x = wrap(t * 24 * S + fw, W + 2 * fw) - fw, y = waterY + H * 0.08;
+  const lit = clamp(1 - F.aN * 1.3);                                // gündüz tonu → gece siluetine geçiş
+  const hull = mixc([22, 20, 32], [238, 232, 224], lit);
+  const band = mixc([36, 12, 14], [176, 42, 38], lit);
+
+  c.save();
+  c.strokeStyle = rgba([230, 236, 245], 0.08 + 0.2 * lit);                                    // iz
+  c.lineWidth = 1.2 * S;
+  c.beginPath();
+  c.moveTo(x + fw * 0.05, y - h * 0.15); c.lineTo(x - 170 * S, y - h * 0.05 - 8 * S);
+  c.moveTo(x + fw * 0.05, y - h * 0.15); c.lineTo(x - 170 * S, y + 6 * S);
+  c.stroke();
+
+  c.translate(x, y);
+  c.fillStyle = rgba(hull, 0.96);                                                             // gövde
+  c.beginPath();
+  c.moveTo(0, -h * 0.9); c.lineTo(fw * 0.86, -h * 0.9);
+  c.quadraticCurveTo(fw, -h * 0.9, fw, -h * 0.2);
+  c.quadraticCurveTo(fw * 0.97, 0, fw * 0.86, 0);
+  c.lineTo(fw * 0.05, 0); c.quadraticCurveTo(0, 0, 0, -h * 0.5);
+  c.closePath(); c.fill();
+  c.fillStyle = rgba(band, 0.96);
+  c.fillRect(fw * 0.04, -h * 0.25, fw * 0.9, h * 0.2);
+  c.fillStyle = rgba(hull, 0.96);                                                             // üst yapılar
+  c.fillRect(fw * 0.12, -h * 1.9, fw * 0.62, h);
+  c.fillRect(fw * 0.24, -h * 2.5, fw * 0.38, h * 0.6);
+  c.fillRect(fw * 0.6, -h * 3.0, fw * 0.12, h * 0.5);
+  c.fillStyle = rgba(band, 0.96);
+  c.fillRect(fw * 0.44, -h * 3.2, fw * 0.09, h * 0.9);                                        // baca
+  c.fillStyle = WIN[0]; c.globalAlpha = F.aN * 0.95;                                          // kabin pencereleri
+  for (let i = 0; i < 12; i++) c.fillRect(fw * (0.15 + i * 0.047), -h * 1.6, fw * 0.024, h * 0.26);
+  for (let i = 0; i < 9; i++) c.fillRect(fw * (0.27 + i * 0.038), -h * 2.2, fw * 0.02, h * 0.22);
+  c.restore();
+
+  halos.push({ x: x + fw * 0.6, y: y - h * 2.6, r: 16 * S, c: '255,200,130', a: 0.5, n: true });
+  halos.push({ x: x + fw * 0.97, y: y - h * 0.9, r: 6 * S, c: '240,248,255', a: 0.9, n: true });
+}
+
+function drawBirds(t) {
+  ctx.save();
+  ctx.strokeStyle = rgba([14, 12, 22], 0.8 * (1 - 0.85 * F.nite));
+  ctx.lineCap = 'round';
+  for (const b of birds) {
+    const x = wrap(b.x0 + b.v * t + 40 * S, W + 80 * S) - 40 * S;
+    const y = b.y + Math.sin(t * 0.6 + b.bob) * 10 * S;
+    const flap = 0.5 + 0.5 * Math.sin(t * b.fr + b.ph);
+    const s = b.s, w = s * (0.25 + 0.35 * flap);                                             // kanat açısı
+    ctx.lineWidth = Math.max(1, s * 0.16);
+    ctx.beginPath();
+    ctx.moveTo(x - s, y - w);
+    ctx.quadraticCurveTo(x - s * 0.5, y - w * 0.2 + s * 0.1, x, y);
+    ctx.quadraticCurveTo(x + s * 0.5, y - w * 0.2 + s * 0.1, x + s, y - w);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawHalos() {
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const h of halos) {
+    const k = h.a * (h.n ? F.aN : 1);
+    if (k < 0.01) continue;
+    const g = ctx.createRadialGradient(h.x, h.y, 0, h.x, h.y, h.r);
+    g.addColorStop(0, `rgba(${h.c},${k})`);
+    g.addColorStop(1, `rgba(${h.c},0)`);
+    ctx.fillStyle = g;
+    ctx.fillRect(h.x - h.r, h.y - h.r, h.r * 2, h.r * 2);
+  }
+  ctx.restore();
+}
+
+function drawVignette() {
+  const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.45, W / 2, H / 2, Math.max(W, H) * 0.75);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(1, 'rgba(0,0,0,0.45)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+/* ---------- döngü ---------- */
+function frame(now) {
+  const t = (now - t0) / 1000;
+  const p = clamp(t / DURATION);
+  const sky = skyAt(p), sun = sunAt(p);
+  Object.assign(F, {
+    t, p,
+    aN: smooth(0.55, 0.95, p),
+    nite: smooth(0.82, 1, p),
+    sunVis: smooth(-0.02, 0.12, sun.alt),
+    redA: smooth(0.6, 0.9, p) * (Math.sin(t * 2.6) > 0.55 ? 1 : 0.25)
+  });
+  halos.length = 0;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const sunX = sun.x * W, sunY = waterY - sun.alt * H;
+
+  drawSky(sky, sunX, sunY, sun.alt, t);
+  drawClouds(t, sky);
+  drawWater(sky);
+  drawShore(t, sky);
+  ctx.drawImage(shore, 0, 0, W, H);
+  drawReflection(t);
+  drawRipples(t, sky);
+  drawGlints(t, sunX);
+  drawHaze(sky);
+  drawFerry(t);
+  drawBirds(t);
+  drawHalos();
+  drawVignette();
+
+  requestAnimationFrame(frame);
+}
+
+function resize() {
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  shore.width = canvas.width; shore.height = canvas.height;
+  S = Math.max(0.45, Math.min(W / 1440, H / 860));
+  waterY = H * 0.66;
+  build();
+}
+
+function restart() {
+  t0 = performance.now();
+  hint.style.opacity = '1';
+  setTimeout(() => { hint.style.opacity = '0'; }, 5000);
+}
+
+window.addEventListener('resize', resize);
+window.addEventListener('keydown', e => { if (e.key === 'r' || e.key === 'R') restart(); });
+canvas.addEventListener('click', restart);
+
+resize();
+setTimeout(() => { hint.style.opacity = '0'; }, 5000);
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1174 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>İstanbul — Boğaz'da Akşam</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060c; overflow: hidden; cursor: default; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #title {
+    position: fixed; left: 0; right: 0; top: 13vh; text-align: center; pointer-events: none;
+    font-family: "Cormorant Garamond", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    color: rgba(255, 244, 230, .88); font-weight: 300; letter-spacing: .62em; text-indent: .62em;
+    font-size: clamp(15px, 2.1vw, 30px); opacity: 0; transition: opacity 4s ease;
+    text-shadow: 0 0 30px rgba(60, 20, 10, .35);
+  }
+  #title small {
+    display: block; margin-top: 1em; font-style: italic; letter-spacing: .28em; text-indent: .28em;
+    font-size: .52em; opacity: .75;
+  }
+  #hint {
+    position: fixed; right: 2vw; bottom: 2vh; pointer-events: none; opacity: 0; transition: opacity 3s ease;
+    font: 11px/1.4 Georgia, serif; letter-spacing: .12em; color: rgba(255, 240, 225, .5);
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="title">İSTANBUL<small>Boğaz'da bir akşam</small></div>
+<div id="hint">tıkla: baştan başlat &nbsp;·&nbsp; → basılı tut: zamanı hızlandır</div>
+<script>
+'use strict';
+(() => {
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const DURATION = Math.max(10, parseFloat(new URLSearchParams(location.search).get('sure')) || 210); // kayıt kopyası: ?sure= eklendi               // gün batımından geceye geçiş süresi (sn)
+
+/* ───────────────────────── yardımcılar ───────────────────────── */
+const TAU = Math.PI * 2;
+const clamp = (x, a = 0, b = 1) => x < a ? a : x > b ? b : x;
+const lerp = (a, b, t) => a + (b - a) * t;
+const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const hex = h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const mul = (c, k) => [Math.min(255, c[0] * k), Math.min(255, c[1] * k), Math.min(255, c[2] * k)];
+const rgba = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a < 0 ? 0 : a > 1 ? 1 : a.toFixed(4)})`;
+const mk = (w, h) => { const c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; };
+
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0; let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const gauss = r => (r() + r() + r() + r() - 2) / 0.577;
+function noise1(seed) {
+  const r = rng(seed), c = [];
+  for (let i = 0; i < 5; i++) c.push([Math.pow(2.1, i) * (0.85 + r() * 0.3), r() * TAU, Math.pow(0.5, i)]);
+  return x => { let v = 0; for (const [f, p, a] of c) v += Math.sin(x * f + p) * a; return v / 1.94; };
+}
+function ramp(keys) {
+  const k = keys.map(([p, h]) => [p, hex(h)]);
+  return p => {
+    if (p <= k[0][0]) return k[0][1];
+    for (let i = 1; i < k.length; i++) if (p <= k[i][0]) return mix(k[i - 1][1], k[i][1], (p - k[i - 1][0]) / (k[i][0] - k[i - 1][0]));
+    return k[k.length - 1][1];
+  };
+}
+function profile(pts, amp, seed) {
+  const n = noise1(seed);
+  return u => {
+    let i = 0;
+    while (i < pts.length - 2 && u > pts[i + 1][0]) i++;
+    const [u0, h0] = pts[i], [u1, h1] = pts[i + 1];
+    let t = clamp((u - u0) / (u1 - u0)); t = (1 - Math.cos(t * Math.PI)) / 2;
+    const base = lerp(h0, h1, t);
+    return Math.max(0, base + n(u * 42) * amp * Math.min(1, base / 12));
+  };
+}
+
+/* ───────────────────────── renk paletleri ───────────────────────── */
+const SKY_T = ramp([[0,'#2f4d7e'],[0.15,'#2a4374'],[0.28,'#22355f'],[0.38,'#1b2a52'],[0.48,'#131f43'],[0.58,'#0d1636'],[0.70,'#08102a'],[0.84,'#050a1e'],[1,'#03060f']]);
+const SKY_U = ramp([[0,'#7088ad'],[0.15,'#69739c'],[0.28,'#585884'],[0.38,'#48436e'],[0.48,'#312f5c'],[0.58,'#212450'],[0.70,'#141a3e'],[0.84,'#0c1231'],[1,'#070c22']]);
+const SKY_L = ramp([[0,'#e6b095'],[0.15,'#e19a86'],[0.28,'#d67d74'],[0.38,'#b7606c'],[0.48,'#7f4664'],[0.58,'#4a3560'],[0.70,'#272851'],[0.84,'#161c3d'],[1,'#0e1430']]);
+const SKY_H = ramp([[0,'#ffd8a2'],[0.15,'#ffbf84'],[0.28,'#ff9b5e'],[0.38,'#f0784e'],[0.48,'#c65a4e'],[0.58,'#84475b'],[0.70,'#4a3653'],[0.84,'#2a2846'],[1,'#1f1f38']]);
+const DARK  = ramp([[0,'#3a2d3f'],[0.3,'#2b2238'],[0.5,'#1c192c'],[0.7,'#111220'],[1,'#080a13']]);
+const ASIA  = ramp([[0,'#9c7568'],[0.18,'#92655c'],[0.3,'#734b53'],[0.38,'#4a3445'],[0.5,'#2a2235'],[0.7,'#14131f'],[1,'#0a0b15']]);
+const NEARL = ramp([[0,'#7a594f'],[0.18,'#71504a'],[0.3,'#583b43'],[0.38,'#382937'],[0.5,'#1e1928'],[0.7,'#0f0f19'],[1,'#07080f']]);
+const WATER = ramp([[0,'#22304a'],[0.35,'#2a2645'],[0.55,'#171a34'],[0.75,'#0a0d1e'],[1,'#03050b']]);
+const AMB   = ramp([[0,'#ffe0c4'],[0.2,'#f4c3a6'],[0.32,'#d49a8e'],[0.42,'#937a96'],[0.55,'#565a80'],[0.7,'#33395b'],[1,'#22263e']]);
+const CN    = ramp([[0,'#fff0cf'],[0.15,'#ffd29a'],[0.28,'#ffaa6e'],[0.38,'#f27a5c'],[0.48,'#c45a6a'],[0.58,'#6e3f62'],[0.7,'#352e4e'],[0.85,'#1e2038'],[1,'#171a2e']]);
+const CF    = ramp([[0,'#efc8b8'],[0.15,'#e6ad9e'],[0.28,'#d38b92'],[0.38,'#ab6d8a'],[0.48,'#78527b'],[0.58,'#46405f'],[0.7,'#2b2c48'],[0.85,'#1a1d33'],[1,'#14172a']]);
+const WCOL  = [[255,196,118],[255,214,160],[255,174,92],[214,226,255],[250,236,212]];
+const WCOL_W = [0.34, 0.26, 0.15, 0.1, 0.15];
+const LED   = [[190,210,255],[160,182,255],[204,172,255],[255,222,192],[188,230,255]];
+const SODIUM = [255,176,98], WARM = [255,206,150];
+
+/* ───────────────────────── ışık sprite'ları ───────────────────────── */
+const spriteCache = new Map();
+function sprite(c) {
+  const k = ((c[0] >> 3) << 10) | ((c[1] >> 3) << 5) | (c[2] >> 3);
+  let s = spriteCache.get(k);
+  if (!s) {
+    s = mk(64, 64); const g = s.getContext('2d');
+    const gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, 'rgba(255,255,255,1)');
+    gr.addColorStop(0.07, rgba(mix(c, [255,255,255], 0.45), 0.95));
+    gr.addColorStop(0.2, rgba(c, 0.36));
+    gr.addColorStop(0.5, rgba(c, 0.07));
+    gr.addColorStop(1, rgba(c, 0));
+    g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
+    spriteCache.set(k, s);
+  }
+  return s;
+}
+function glow(g, x, y, r, c, a) {
+  if (a <= 0.004) return;
+  g.globalAlpha = Math.min(1, a);
+  g.drawImage(sprite(c), x - r, y - r, r * 2, r * 2);
+}
+
+/* ───────────────────────── katman (maske + renklendirme) ───────────────────────── */
+class Layer {
+  constructor(x0, y0, w, h) {
+    this.x0 = Math.floor(x0); this.y0 = Math.floor(y0);
+    this.w = Math.max(1, Math.ceil(w)); this.h = Math.max(1, Math.ceil(h));
+    this.m = mk(this.w, this.h); this.mc = this.m.getContext('2d');
+    this.mc.setTransform(1, 0, 0, 1, -this.x0, -this.y0);
+    this.mc.fillStyle = '#fff'; this.mc.strokeStyle = '#fff';
+    this.t = mk(this.w, this.h); this.tc = this.t.getContext('2d');
+  }
+  tint(fills) {
+    const c = this.tc;
+    c.setTransform(1, 0, 0, 1, 0, 0); c.globalAlpha = 1; c.globalCompositeOperation = 'source-over';
+    c.clearRect(0, 0, this.w, this.h); c.drawImage(this.m, 0, 0);
+    c.setTransform(1, 0, 0, 1, -this.x0, -this.y0);
+    fills.forEach((f, i) => {
+      c.globalCompositeOperation = i ? 'source-atop' : 'source-in';
+      c.fillStyle = f(c); c.fillRect(this.x0, this.y0, this.w, this.h);
+    });
+    c.globalCompositeOperation = 'source-over';
+  }
+  draw(g, a = 1) { if (a <= 0.003) return; g.globalAlpha = a; g.drawImage(this.t, this.x0, this.y0); g.globalAlpha = 1; }
+}
+
+/* ───────────────────────── sahne durumu ───────────────────────── */
+let R, W, HT, H, H2, YK, S;
+let sceneC, sceneX, nearC, nearX, kizC, kizX, vigC, moonC;
+const L = {};
+let P = {};                                     // profiller
+let skyline, bridge, stars, clouds, glitter, wavesL, wavesD, gulls, vapurs, cars;
+let winCity, winNear, glintCity, glintNear;
+let lampsFar, lampsNear, monuLights, nearMonuLights, kizLights, tinyLights;
+let kizGeo, sunX = 0, lastTint = -1, shooting = null;
+
+/* çizim yardımcıları (maskeler için) */
+function halfEl(c, x, y, rx, ry) { c.moveTo(x - rx, y); c.ellipse(x, y, rx, ry, 0, Math.PI, TAU); c.closePath(); }
+function ridge(c, f, u0, u1, base) {
+  c.beginPath(); c.moveTo(u0 * W, base + 2);
+  for (let x = u0 * W; x <= u1 * W; x += 2) c.lineTo(x, base - f(x / W) * S);
+  c.lineTo(u1 * W, base - f(u1) * S); c.lineTo(u1 * W, base + 2); c.closePath(); c.fill();
+}
+function minaret(c, x, by, h, w, nS, onLight) {
+  c.beginPath();
+  c.rect(x - w * 0.75, by - h * 0.13, w * 1.5, h * 0.13 + 3 * S);
+  c.moveTo(x - w * 0.75, by - h * 0.13); c.lineTo(x - w * 0.5, by - h * 0.16); c.lineTo(x + w * 0.5, by - h * 0.16); c.lineTo(x + w * 0.75, by - h * 0.13); c.closePath();
+  const st = by - h * 0.84;
+  c.rect(x - w * 0.5, st, w, h * 0.84 - h * 0.15);
+  for (let i = 0; i < nS; i++) {
+    const f = nS === 1 ? 0.74 : lerp(0.58, 0.79, i / (nS - 1));
+    const yb = by - h * f;
+    c.rect(x - w * 0.95, yb - w * 0.4, w * 1.9, w * 0.4);
+    c.moveTo(x - w * 0.95, yb); c.lineTo(x + w * 0.95, yb); c.lineTo(x + w * 0.5, yb + w * 0.9); c.lineTo(x - w * 0.5, yb + w * 0.9); c.closePath();
+    onLight && onLight(x, yb - w * 0.2);
+  }
+  c.moveTo(x - w * 0.62, st); c.lineTo(x, by - h); c.lineTo(x + w * 0.62, st); c.closePath();
+  const aw = Math.max(0.5 * R, w * 0.14);
+  c.rect(x - aw / 2, by - h - w * 1.4, aw, w * 1.4);
+  c.fill();
+}
+function drawMosque(c, cx, by, D, nMin, nS, onLight) {
+  c.beginPath();
+  if (nMin === 4) {                                   // avlu revakları
+    c.rect(cx - 3.05 * D, by - D * 0.42, 6.1 * D, D * 0.42 + 3 * S);
+    for (let x = -2.85; x <= 2.86; x += 0.38) if (Math.abs(x) > 1.6) halfEl(c, cx + x * D, by - D * 0.42, D * 0.14, D * 0.12);
+  }
+  const bw = D * 3.2, bh = D * 0.95, y1 = by - bh;
+  c.rect(cx - bw / 2, y1, bw, bh + 3 * S);
+  for (const i of [-1.35, -0.8, 0.8, 1.35]) halfEl(c, cx + i * D, y1, D * 0.2, D * 0.16);
+  const y2 = y1 - D * 0.32;
+  c.rect(cx - D * 1.5, y2, D * 3.0, D * 0.33);
+  halfEl(c, cx - D * 1.02, y2 + 1, D * 0.62, D * 0.46);
+  halfEl(c, cx + D * 1.02, y2 + 1, D * 0.62, D * 0.46);
+  halfEl(c, cx - D * 1.52, y2 + 1, D * 0.3, D * 0.24);
+  halfEl(c, cx + D * 1.52, y2 + 1, D * 0.3, D * 0.24);
+  const y3 = y2 - D * 0.3;
+  c.rect(cx - D * 0.9, y3, D * 1.8, D * 0.32);
+  halfEl(c, cx, y3 + 1, D * 0.92, D * 0.74);
+  for (const s of [-1, 1]) {
+    c.rect(cx + s * D * 0.86 - D * 0.08, y3 - D * 0.22, D * 0.16, D * 0.24);
+    halfEl(c, cx + s * D * 0.86, y3 - D * 0.22, D * 0.08, D * 0.09);
+  }
+  c.rect(cx - D * 0.025, y3 - D * 0.74 - D * 0.3, D * 0.05, D * 0.33);
+  c.fill();
+  const ms = nMin === 4 ? [[-1.78, 3.35, 3], [1.78, 3.35, 3], [-2.95, 2.7, 2], [2.95, 2.7, 2]]
+           : nMin === 2 ? [[-1.8, 3.1, nS], [1.8, 3.1, nS]] : [[1.78, 3.0, nS]];
+  for (const [o, hk, s] of ms) minaret(c, cx + o * D, by, D * hk, Math.max(1.1 * S, D * 0.15), s, onLight);
+}
+function drawGalata(c, cx, by) {
+  const k = S, w = 13 * k;
+  c.beginPath();
+  c.rect(cx - w / 2, by - 50 * k, w, 58 * k);
+  c.rect(cx - w * 0.64, by - 53 * k, w * 1.28, 3 * k);
+  c.rect(cx - w * 0.47, by - 62 * k, w * 0.94, 9.5 * k);
+  c.moveTo(cx - w * 0.57, by - 61.5 * k); c.lineTo(cx, by - 84 * k); c.lineTo(cx + w * 0.57, by - 61.5 * k); c.closePath();
+  c.rect(cx - 0.35 * k, by - 89 * k, 0.7 * k, 6 * k);
+  c.fill();
+}
+function cypress(c, x, by, h, w) {
+  c.beginPath(); c.moveTo(x, by - h);
+  c.quadraticCurveTo(x + w * 0.95, by - h * 0.45, x + w * 0.4, by);
+  c.lineTo(x - w * 0.4, by);
+  c.quadraticCurveTo(x - w * 0.95, by - h * 0.45, x, by - h);
+  c.fill();
+}
+function tree(c, r, x, by, s) {
+  c.beginPath();
+  for (let i = 0; i < 6; i++) { const a = r() * Math.PI, d = r() * s * 0.6; c.moveTo(x, by); c.arc(x + Math.cos(a) * d, by - s * 0.55 - Math.sin(a) * d * 0.6, s * (0.35 + r() * 0.25), 0, TAU); }
+  c.fill();
+}
+
+/* şehir üretimi */
+function genCity(r, prof, u0, u1, base, cfg) {
+  const B = [];
+  const n = Math.round((u1 - u0) * W / (S * (cfg.wMin + cfg.wVar / 2) * cfg.scale) * cfg.rows);
+  for (let i = 0; i < n; i++) {
+    const u = u0 + r() * (u1 - u0), top = prof(u) * S;
+    if (top < 3 * S) continue;
+    const d = Math.pow(r(), 0.8);
+    const by = base - top * (1 - d) * 0.98 + r() * 3 * S;
+    const k = cfg.scale * (0.85 + 0.3 * d);
+    const bw = (cfg.wMin + r() * cfg.wVar) * S * k;
+    let bh = (cfg.hMin + r() * cfg.hVar) * S * k;
+    if (r() < cfg.tallP) bh *= 1.7 + r();
+    const roof = r() < cfg.roofP ? (0.16 + r() * 0.16) * bw : 0;
+    B.push({ x: u * W - bw / 2, y: by - bh, w: bw, h: bh, by, roof, tank: !roof && r() < 0.4, ant: r() < 0.08, cumba: r() < 0.5, chim: r() < 0.4 });
+  }
+  B.sort((a, b) => a.by - b.by);
+  return B;
+}
+function pickColor(r) { let v = r(), i = 0; while (i < 4 && v > WCOL_W[i]) v -= WCOL_W[i++]; return i; }
+function genWindows(r, B, cfg, wins, glints, glintMinX) {
+  const ww = cfg.ww * S, wh = cfg.wh * S, gx = cfg.gx * S, gy = cfg.gy * S;
+  for (let i = 0; i < B.length; i++) {
+    const b = B[i];
+    const cols = Math.floor((b.w - gx * 0.5) / gx), rows = Math.floor((b.h - gy * 0.4) / gy);
+    if (cols < 1 || rows < 1) continue;
+    const ox = b.x + (b.w - cols * gx) / 2 + (gx - ww) / 2, oy = b.y + (b.h - rows * gy) * 0.35 + (gy - wh) / 2;
+    for (let rr = 0; rr < rows; rr++) for (let cc = 0; cc < cols; cc++) {
+      const wx = ox + cc * gx, wy = oy + rr * gy;
+      let hid = false;
+      for (let j = i + 1; j < B.length; j++) {
+        const o = B[j];
+        if (o.by <= b.by) continue;
+        if (wx + ww > o.x - 2 * S && wx < o.x + o.w + 2 * S && wy + wh > o.y - o.roof && wy < o.by + 8 * S) { hid = true; break; }
+      }
+      if (hid) continue;
+      if (glints && wx > glintMinX && r() < cfg.glintP) glints.push({ x: wx, y: wy, w: ww, h: wh, ph: r() * TAU, a: 0.35 + r() * 0.65 });
+      if (r() > cfg.prob) continue;
+      const on = 0.35 + 0.46 * (r() + r() + r()) / 3;
+      wins[pickColor(r)].push({ x: wx, y: wy, w: ww, h: wh, on, a: 0.55 + r() * 0.45, fl: r() < 0.1, ph: r() * 100, off: r() < 0.06 ? 0.86 + r() * 0.12 : 9 });
+    }
+  }
+}
+
+/* ───────────────────────── kurulum ───────────────────────── */
+function build() {
+  R = Math.min(window.devicePixelRatio || 1, 1.5);
+  W = Math.max(320, Math.round(innerWidth * R));
+  HT = Math.max(240, Math.round(innerHeight * R));
+  cv.width = W; cv.height = HT;
+  S = Math.min(HT / 1000, W / 1500);
+  H = Math.round(HT * 0.62);
+  H2 = H + Math.round(95 * S);
+  YK = H + Math.round(54 * S);
+  spriteCache.clear();
+
+  sceneC = mk(W, H); sceneX = sceneC.getContext('2d');
+
+  /* profiller (yükseklik, S biriminde) */
+  P.eu = profile([[-0.05,96],[0.03,102],[0.08,112],[0.125,118],[0.17,104],[0.2,78],[0.218,30],[0.232,16],[0.248,24],[0.27,58],[0.31,80],[0.35,92],[0.385,96],[0.42,70],[0.447,28],[0.462,0]], 4, 11);
+  P.as = profile([[0.528,0],[0.548,16],[0.6,36],[0.66,50],[0.72,60],[0.8,74],[0.9,88],[1.05,96]], 4, 12);
+  const pBE = profile([[-0.05,142],[0.06,152],[0.14,140],[0.2,128],[0.3,118],[0.4,98],[0.44,72],[0.48,30],[0.5,10]], 7, 13);
+  const pBA = profile([[0.5,10],[0.53,24],[0.58,50],[0.65,78],[0.75,100],[0.85,124],[0.95,138],[1.05,140]], 7, 14);
+  P.back = u => u < 0.5 ? pBE(u) : pBA(u);
+  P.A = profile([[0.4,6],[0.43,20],[0.47,27],[0.5,22],[0.54,30],[0.6,22],[0.64,8]], 3, 15);
+  P.near = profile([[0.585,0],[0.61,8],[0.65,26],[0.7,44],[0.76,66],[0.82,108],[0.88,160],[0.94,196],[1.05,215]], 5, 16);
+
+  const r = rng(1453);
+
+  /* uzak tepeler */
+  L.A = new Layer(0, H - 50 * S, W, 50 * S + 2);
+  ridge(L.A.mc, P.A, 0.4, 0.64, H);
+  L.B = new Layer(0, H - 230 * S, W, 230 * S + 2);
+  ridge(L.B.mc, P.back, 0, 1, H);
+  for (let x = 0; x < W; x += (1.5 + r() * 4) * S) {          // uzak semt dokusu
+    const hgt = P.back(x / W) * S; if (hgt < 6 * S) continue;
+    L.B.mc.fillRect(x, H - hgt - (0.5 + r() * 3.5) * S, (1.5 + r() * 4) * S, 6 * S);
+  }
+
+  /* orta plan şehir + anıtlar */
+  L.city = new Layer(0, H - 280 * S, W, 280 * S + 2);
+  L.monu = new Layer(0, H - 280 * S, W, 280 * S + 2);
+  const cc = L.city.mc, mc = L.monu.mc;
+  ridge(cc, P.eu, -0.01, 0.462, H);
+  ridge(cc, P.as, 0.528, 1.01, H);
+
+  monuLights = [];
+  const foot = [];
+  const onMonu = (x, y) => monuLights.push({ x, y, on: 0.5 + r() * 0.08, c: [255, 224, 170] });
+  const addMosque = (u, by, D, nMin, nS) => {
+    drawMosque(mc, u * W, by, D, nMin, nS, onMonu);
+    const ext = nMin === 4 ? 3.1 : 1.9;
+    foot.push({ x0: u * W - ext * D, x1: u * W + ext * D, by });
+  };
+  addMosque(0.125, H - P.eu(0.125) * S + 6 * S, 24 * S, 4, 2);            // Süleymaniye
+  addMosque(0.048, H - P.eu(0.048) * S + 5 * S, 15 * S, 2, 2);
+  addMosque(0.195, H - 8 * S, 15 * S, 2, 2);                               // Yeni Cami
+  addMosque(0.432, H - 5 * S, 9.5 * S, 1, 1);                              // Kılıç Ali Paşa
+  addMosque(0.6, H - P.as(0.6) * S * 0.45, 12 * S, 2, 1);              // Beylerbeyi
+  const gx = 0.382 * W, gb = H - P.eu(0.382) * S + 4 * S;                  // Galata
+  drawGalata(mc, gx, gb);
+  foot.push({ x0: gx - 9 * S, x1: gx + 9 * S, by: gb });
+  for (const k of [-0.75, 0.75, -1.2, 1.2]) monuLights.push({ x: gx + k * 4 * S, y: gb - 57 * S, on: 0.48 + r() * 0.03, c: [255, 214, 150] });
+
+  const cfgMid = { wMin: 6, wVar: 10, hMin: 6, hVar: 12, scale: 1, rows: 5, tallP: 0.1, roofP: 0.45 };
+  let B = genCity(r, P.eu, 0.0, 0.452, H, cfgMid).concat(genCity(r, P.as, 0.536, 1.0, H, { ...cfgMid, scale: 0.92 }));
+  B = B.filter(b => !foot.some(f => b.x + b.w > f.x0 && b.x < f.x1 && b.by > f.by - 3 * S));
+  B.sort((a, b) => a.by - b.by);
+  for (const b of B) {
+    cc.fillRect(b.x, b.y, b.w, b.by - b.y + 8 * S);
+    if (b.roof) { cc.beginPath(); cc.moveTo(b.x - 0.6 * S, b.y + 0.3 * S); cc.lineTo(b.x + b.w / 2, b.y - b.roof); cc.lineTo(b.x + b.w + 0.6 * S, b.y + 0.3 * S); cc.fill(); }
+    else if (b.tank) cc.fillRect(b.x + b.w * 0.6, b.y - 1.6 * S, 2 * S, 1.7 * S);
+    if (b.ant) cc.fillRect(b.x + b.w * 0.3, b.y - 5 * S, Math.max(0.6, 0.35 * S), 5 * S);
+  }
+  for (const [u, n] of [[0.1, 4], [0.155, 3], [0.064, 2], [0.62, 3], [0.69, 2]]) {   // selviler
+    for (let i = 0; i < n; i++) { const x = (u + (r() - 0.5) * 0.02) * W; cypress(cc, x, H - P.eu(u) * S * (u < 0.5 ? 0.85 : 0) - (u > 0.5 ? P.as(u) * S * 0.5 : 0) + 3 * S, (9 + r() * 7) * S, (2 + r()) * S); }
+  }
+  winCity = [[], [], [], [], []]; glintCity = [];
+  genWindows(r, B, { ww: 1.1, wh: 1.5, gx: 3, gy: 4, prob: 0.5, glintP: 0.2 }, winCity, glintCity, 0.535 * W);
+
+  /* silüet çizgisi (köprü ışıklarının görünürlüğü için) */
+  skyline = new Float32Array(W).fill(H);
+  for (const ly of [L.city, L.monu]) {
+    const d = ly.mc.getImageData(0, 0, ly.w, ly.h).data;
+    for (let x = 0; x < ly.w; x++) for (let y = 0; y < ly.h; y++) {
+      if (d[(y * ly.w + x) * 4 + 3] > 40) { const wy = y + ly.y0; if (wy < skyline[x + ly.x0]) skyline[x + ly.x0] = wy; break; }
+    }
+  }
+
+  /* uzak tepelerdeki minik ışıklar */
+  tinyLights = [];
+  for (let i = 0; i < 420; i++) {
+    const u = r(), x = u * W, top = H - P.back(u) * S;
+    const y = lerp(top + 2 * S, H - 3 * S, Math.pow(r(), 0.8));
+    if (y > skyline[Math.min(W - 1, x | 0)] - 1.5 * S || y < top + 1.5 * S) continue;
+    tinyLights.push({ x, y, on: 0.42 + r() * 0.4, c: WCOL[pickColor(r)], a: 0.35 + r() * 0.5, ph: r() * TAU });
+  }
+  for (let i = 0; i < 40; i++) {
+    const u = lerp(0.42, 0.62, r()), x = u * W, top = H - P.A(u) * S;
+    const y = lerp(top + 1.5 * S, H - 1.5 * S, r());
+    if (y > skyline[x | 0] - 1 || y < top + 1) continue;
+    tinyLights.push({ x, y, on: 0.45 + r() * 0.35, c: WCOL[pickColor(r)], a: 0.25 + r() * 0.35, ph: r() * TAU });
+  }
+
+  /* sahil fenerleri (uzak) */
+  lampsFar = [];
+  for (let x = 0.006 * W; x < 0.458 * W; x += 0.0105 * W) lampsFar.push({ x: x + (r() - 0.5) * 3 * S, y: H - 2.2 * S, on: 0.405 + (x / W) * 0.1, c: SODIUM });
+  for (let x = 0.535 * W; x < 0.8 * W; x += 0.0105 * W) lampsFar.push({ x: x + (r() - 0.5) * 3 * S, y: H - 2.2 * S, on: 0.43 + (x / W - 0.53) * 0.12, c: SODIUM });
+
+  /* köprü */
+  buildBridge(r);
+
+  /* yakın Asya kıyısı (Üsküdar) */
+  const nx0 = Math.floor(0.575 * W), ny0 = Math.floor(H2 - 300 * S), nh = H2 - ny0 + 3;
+  L.near = new Layer(nx0, ny0, W - nx0, nh);
+  L.nearD = new Layer(nx0, ny0, W - nx0, nh);
+  L.nearM = new Layer(nx0, ny0, W - nx0, nh);
+  nearC = mk(L.near.w, L.near.h); nearX = nearC.getContext('2d');
+  const nc = L.near.mc, nd = L.nearD.mc, nm = L.nearM.mc;
+  ridge(nc, P.near, 0.585, 1.01, H2);
+  nc.fillRect(0.598 * W, H2 - 4 * S, W, 6 * S);                              // rıhtım
+  nearMonuLights = [];
+  const nFoot = [];
+  const onNear = (x, y) => nearMonuLights.push({ x, y, on: 0.5 + r() * 0.06, c: [255, 222, 168] });
+  drawMosque(nm, 0.718 * W, H2 - 7 * S, 31 * S, 2, 2, onNear);               // Mihrimah Sultan
+  nFoot.push({ x0: 0.718 * W - 64 * S, x1: 0.718 * W + 64 * S, by: H2 - 7 * S });
+  const sm = 0.905, smb = H2 - P.near(sm) * S + 5 * S;
+  drawMosque(nm, sm * W, smb, 13 * S, 1, 1, onNear);
+  nFoot.push({ x0: sm * W - 26 * S, x1: sm * W + 26 * S, by: smb });
+  for (const [u, n] of [[0.655, 3], [0.765, 4], [0.83, 3], [0.94, 3], [0.975, 2]]) {
+    for (let i = 0; i < n; i++) { const x = (u + (r() - 0.5) * 0.025) * W; cypress(nc, x, H2 - P.near(x / W) * S * (0.75 + r() * 0.2) + 4 * S, (18 + r() * 16) * S, (4 + r() * 2) * S); }
+  }
+  for (let i = 0; i < 26; i++) { const u = lerp(0.62, 1, r()); tree(nc, r, u * W, H2 - P.near(u) * S * (0.6 + r() * 0.4) + 6 * S, (7 + r() * 8) * S); }
+  let NB = genCity(r, P.near, 0.6, 1.0, H2 - 4 * S, { wMin: 14, wVar: 16, hMin: 12, hVar: 15, scale: 1, rows: 4.2, tallP: 0.07, roofP: 0.88 });
+  NB = NB.filter(b => !nFoot.some(f => b.x + b.w > f.x0 && b.x < f.x1 && b.by > f.by - 26 * S));
+  for (const b of NB) {
+    nc.fillRect(b.x, b.y, b.w, b.by - b.y + 8 * S);
+    if (b.cumba && b.h > 14 * S) nc.fillRect(b.x - 1.6 * S, b.y + 0.5 * S, b.w + 3.2 * S, b.h * 0.42);
+    if (b.roof) {
+      nc.beginPath(); nc.moveTo(b.x - 2.4 * S, b.y + 0.6 * S); nc.lineTo(b.x + b.w / 2, b.y - b.roof); nc.lineTo(b.x + b.w + 2.4 * S, b.y + 0.6 * S); nc.fill();
+      if (b.chim) nc.fillRect(b.x + b.w * 0.7, b.y - b.roof * 0.85, 1.6 * S, b.roof * 0.85);
+    }
+    // cephe detayı: sonraki binalar öncekileri örter
+    nd.clearRect(b.x - 2.4 * S, b.y - b.roof, b.w + 4.8 * S, b.by - b.y + b.roof + 8 * S);
+    nd.globalAlpha = 0.04 + r() * 0.16; nd.fillRect(b.x, b.y, b.w, b.by - b.y + 8 * S);
+    if (b.roof) {
+      nd.globalAlpha = 0.35; nd.lineWidth = Math.max(0.7, 0.7 * S);
+      nd.beginPath(); nd.moveTo(b.x - 2.4 * S, b.y + 0.6 * S); nd.lineTo(b.x + b.w / 2, b.y - b.roof); nd.stroke();
+    }
+    nd.globalAlpha = 1;
+  }
+  winNear = [[], [], [], [], []]; glintNear = [];
+  genWindows(r, NB, { ww: 2.0, wh: 3.4, gx: 5.6, gy: 8, prob: 0.55, glintP: 0.32 }, winNear, glintNear, 0);
+  lampsNear = [];
+  for (let x = 0.612 * W, i = 0; x < W; x += 0.034 * W, i++) {
+    nc.fillRect(x - 0.4 * S, H2 - 22 * S, 0.8 * S, 19 * S);
+    nc.fillRect(x - 1.6 * S, H2 - 23.5 * S, 3.2 * S, 1.8 * S);
+    lampsNear.push({ x, y: H2 - 21.6 * S, on: 0.415 + i * 0.006, c: [255, 192, 122] });
+  }
+
+  /* Kız Kulesi */
+  const kx0 = Math.floor(0.5 * W - 60 * S), ky0 = Math.floor(YK - 120 * S);
+  L.kiz = new Layer(kx0, ky0, 120 * S, YK - ky0 + 3);
+  kizC = mk(L.kiz.w, L.kiz.h); kizX = kizC.getContext('2d');
+  buildKiz(L.kiz.mc, 0.5 * W, YK);
+
+  /* gökyüzü öğeleri */
+  buildSky();
+  /* su */
+  buildWater();
+  /* canlılar ve tekneler */
+  buildLife();
+
+  /* vinyet */
+  vigC = mk(W, HT);
+  const vg = vigC.getContext('2d');
+  const gr = vg.createRadialGradient(W / 2, HT * 0.55, Math.min(W, HT) * 0.3, W / 2, HT * 0.55, Math.hypot(W, HT) * 0.62);
+  gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,0.5)');
+  vg.fillStyle = gr; vg.fillRect(0, 0, W, HT);
+
+  lastTint = -1;
+}
+
+function buildBridge(r) {
+  const xL = 0.315 * W, xR = 0.655 * W, tL = H - 205 * S, tR = H - 186 * S, dL = H - 62 * S, dR = H - 56 * S;
+  const xa = 0.205 * W, xb = 0.775 * W;
+  const deck = x => lerp(dL, dR, (x - xL) / (xR - xL));
+  const sagM = (deck((xL + xR) / 2) - 7 * S) - (tL + tR) / 2;
+  const ya = deck(xa) - 1 * S, yb = deck(xb) - 1 * S;
+  const cable = x => {
+    if (x < xL) { const v = (x - xa) / (xL - xa); return lerp(ya, tL, v) + 7 * S * 4 * v * (1 - v); }
+    if (x > xR) { const v = (x - xR) / (xb - xR); return lerp(tR, yb, v) + 6 * S * 4 * v * (1 - v); }
+    const u = (x - xL) / (xR - xL); return lerp(tL, tR, u) + sagM * 4 * u * (1 - u);
+  };
+  const hangers = [];
+  let s = 1;
+  for (let x = xa + 0.006 * W; x < xb - 0.004 * W; x += 0.0052 * W) {
+    if (Math.abs(x - xL) < 0.004 * W || Math.abs(x - xR) < 0.004 * W) continue;
+    const y = cable(x), d = deck(x);
+    if (d - y < 3 * S) continue;
+    hangers.push([x, y, x + s * 0.004 * W, d - 1.5 * S]); s = -s;
+  }
+  const lights = [];
+  const addL = x => {
+    const y = cable(x) - 0.4 * S;
+    const xi = Math.min(W - 1, Math.max(0, x | 0));
+    lights.push({ x, y, on: 0.5 + (x - xa) / (xb - xa) * 0.045, vis: y < skyline[xi] - 1.5 * S, i: lights.length });
+  };
+  for (let i = 0; i <= 16; i++) addL(lerp(xa + 0.01 * W, xL, i / 16));
+  for (let i = 1; i < 64; i++) addL(lerp(xL, xR, i / 64));
+  for (let i = 0; i <= 16; i++) addL(lerp(xR, xb - 0.01 * W, i / 16));
+  const deckL = [];
+  for (let x = xa; x <= xb; x += 0.0062 * W) {
+    const y = deck(x) - 2.2 * S, xi = Math.min(W - 1, x | 0);
+    deckL.push({ x, y, on: 0.43 + (x - xa) / (xb - xa) * 0.03, vis: y < skyline[xi] - 1.5 * S });
+  }
+  bridge = { xL, xR, tL, tR, xa, xb, deck, cable, hangers, lights, deckL };
+  cars = [];
+  for (let i = 0; i < 18; i++) cars.push({ u: r(), dir: r() < 0.5 ? 1 : -1, sp: 0.018 + r() * 0.012 });
+}
+
+function buildKiz(c, cx, by) {
+  const k = S;
+  c.beginPath();
+  c.moveTo(cx - 42 * k, by + 2 * k); c.quadraticCurveTo(cx - 37 * k, by - 5 * k, cx - 29 * k, by - 6 * k);
+  c.lineTo(cx + 31 * k, by - 6 * k); c.quadraticCurveTo(cx + 39 * k, by - 4 * k, cx + 44 * k, by + 2 * k); c.closePath();
+  c.rect(cx - 33 * k, by - 15 * k, 66 * k, 10 * k);
+  c.rect(cx - 25 * k, by - 30 * k, 41 * k, 16 * k);
+  c.moveTo(cx - 26.5 * k, by - 30 * k); c.lineTo(cx - 23 * k, by - 33.5 * k); c.lineTo(cx + 13 * k, by - 33.5 * k); c.lineTo(cx + 17.5 * k, by - 30 * k); c.closePath();
+  const tx = cx + 4 * k;
+  c.rect(tx - 7 * k, by - 62 * k, 14 * k, 33 * k);
+  c.rect(tx - 8.6 * k, by - 64.5 * k, 17.2 * k, 2.6 * k);
+  c.rect(tx - 5.6 * k, by - 73 * k, 11.2 * k, 9 * k);
+  c.rect(tx - 6.6 * k, by - 74.4 * k, 13.2 * k, 1.6 * k);
+  halfEl(c, tx, by - 74 * k, 5.6 * k, 5.8 * k);
+  c.rect(tx - 0.4 * k, by - 87 * k, 0.8 * k, 8 * k);
+  c.rect(cx + 22 * k, by - 23 * k, 7 * k, 9 * k);
+  halfEl(c, cx + 25.5 * k, by - 23 * k, 3.5 * k, 3.2 * k);
+  c.fill();
+  c.fillRect(cx - 20 * k, by - 47 * k, 0.6 * k, 17 * k);         // gönder
+  kizGeo = { cx, by, tx, pole: [cx - 19.4 * k, by - 47 * k] };
+  kizLights = [
+    { x: tx, y: by - 68.5 * k, on: 0.47, c: [255, 232, 186], r: 9, big: 1 },
+    { x: tx - 3 * k, y: by - 52 * k, on: 0.5, c: WARM, r: 4 }, { x: tx + 3 * k, y: by - 52 * k, on: 0.515, c: WARM, r: 4 },
+    { x: tx, y: by - 41 * k, on: 0.53, c: WARM, r: 4 },
+    { x: cx - 18 * k, y: by - 23 * k, on: 0.505, c: WARM, r: 4 }, { x: cx - 8 * k, y: by - 23 * k, on: 0.52, c: WARM, r: 4 },
+    { x: cx + 12 * k, y: by - 23 * k, on: 0.54, c: WARM, r: 4 },
+    { x: cx - 31 * k, y: by - 16 * k, on: 0.46, c: SODIUM, r: 6 }, { x: cx + 31 * k, y: by - 16 * k, on: 0.465, c: SODIUM, r: 6 },
+  ];
+}
+
+function buildSky() {
+  const r = rng(7);
+  stars = [];
+  for (let i = 0; i < 760; i++) {
+    const b = Math.pow(r(), 2.6);
+    const y = (H - 30 * S) * Math.pow(r(), 1.35);
+    stars.push({ x: r() * W, y, b: 0.25 + b * 0.75, s: Math.max(0.7, (0.6 + b * 1.4) * S * 0.9), th: 0.5 + (1 - b) * 0.3 + r() * 0.06, f: 0.6 + r() * 2.4, ph: r() * TAU, warm: r() < 0.25 });
+  }
+  const mr = 8.5 * S;
+  moonC = mk(mr * 4, mr * 4);
+  const m = moonC.getContext('2d'), c = mr * 2;
+  m.fillStyle = 'rgb(255,246,226)'; m.beginPath(); m.arc(c, c, mr, 0, TAU); m.fill();
+  m.globalCompositeOperation = 'destination-out'; m.beginPath(); m.arc(c + mr * 0.42, c - mr * 0.33, mr * 0.98, 0, TAU); m.fill();
+  m.globalCompositeOperation = 'destination-over'; m.fillStyle = 'rgba(140,152,190,0.16)'; m.beginPath(); m.arc(c, c, mr, 0, TAU); m.fill();
+
+  clouds = [];
+  const cr = rng(77);
+  for (let i = 0; i < 11; i++) {
+    const cw = (240 + cr() * 560) * S, th = (6 + cr() * 18) * S, pad = 60 * S;
+    const cnv = mk(cw + pad * 2, th * 3 + pad);
+    const g = cnv.getContext('2d'), n = Math.ceil(cw / (9 * S));
+    for (let k = 0; k < n; k++) {
+      const f = k / (n - 1), tp = Math.pow(Math.sin(Math.PI * f), 0.7);
+      const px = pad + f * cw + (cr() - 0.5) * 14 * S, py = cnv.height / 2 + (cr() - 0.5) * th * 0.7 * tp;
+      const rx = (16 + cr() * 36) * S * (0.4 + 0.6 * tp), ry = Math.max(1.5 * S, (0.25 + cr() * 0.5) * th * tp);
+      g.save(); g.translate(px, py); g.scale(1, ry / rx);
+      const gr = g.createRadialGradient(0, 0, 0, 0, 0, rx);
+      gr.addColorStop(0, 'rgba(255,255,255,0.26)'); gr.addColorStop(0.5, 'rgba(255,255,255,0.11)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+      g.fillStyle = gr; g.fillRect(-rx, -rx, 2 * rx, 2 * rx); g.restore();
+    }
+    const y = H - (125 + Math.pow(cr(), 0.8) * 360) * S;
+    clouds.push({ m: cnv, t: mk(cnv.width, cnv.height), x: cr() * W * 1.2 - 0.2 * W, y: y - cnv.height / 2, sp: (1.5 + cr() * 3) * S, hf: clamp((H - y) / (480 * S)) });
+  }
+}
+
+function buildWater() {
+  const r = rng(99);
+  glitter = [];
+  for (let i = 0; i < 700; i++) glitter.push({ u: r(), v: gauss(r), f: 1.5 + r() * 4, ph: r() * TAU, l: 0.5 + r() });
+  wavesL = []; wavesD = [];
+  for (let i = 0; i < 2600; i++) {
+    const w = { u: r(), x: r(), ph: r() * TAU, f: 0.5 + r() * 1.6, l: 0.4 + r() * 0.9, dr: (r() - 0.5) };
+    (r() < 0.4 ? wavesD : wavesL).push(w);
+  }
+}
+
+function buildLife() {
+  const r = rng(31);
+  gulls = [];
+  for (let i = 0; i < 10; i++) {
+    const z = Math.pow(r(), 1.4);
+    gulls.push({ z, x: r() * W, y0: H - (90 + r() * 330) * S, dir: r() < 0.65 ? 1 : -1, ph: r() * TAU, ph2: r() * TAU, fl: 0, ft: r() * 4, flapping: false, fp: r() * TAU, night: r() < 0.45 });
+  }
+  const mkV = (Lv, by, dir, x, period) => {
+    const c = mk(Lv * 1.15, Lv * 0.37);
+    return { L: Lv, by, dir, x, sp: (W + Lv * 2) / period, c, g: c.getContext('2d'), smoke: [], wake: [], st: 0, wt: 0 };
+  };
+  vapurs = [mkV(70 * S, H + 13 * S, -1, 0.78 * W, 140), mkV(150 * S, H + 34 * S, 1, 0.12 * W, 85)];
+}
+
+/* ───────────────────────── renklendirme ───────────────────────── */
+function retint(p) {
+  const hor = SKY_H(p), dark = DARK(p), asl = ASIA(p), nl = NEARL(p);
+  const night = sstep(0.45, 0.8, p), fl = sstep(0.52, 0.6, p), flK = sstep(0.48, 0.55, p), sunLit = 1 - sstep(0.22, 0.37, p);
+  const eu = mix(dark, hor, 0.22), as = mix(asl, hor, 0.25);
+  const horiz = (e, a) => c => { const g = c.createLinearGradient(0, 0, W, 0); g.addColorStop(0, rgba(e)); g.addColorStop(0.465, rgba(e)); g.addColorStop(0.53, rgba(a)); g.addColorStop(1, rgba(a)); return g; };
+  const haze = (y0, y1, a0, a1) => c => { const g = c.createLinearGradient(0, y0, 0, y1); g.addColorStop(0, rgba(hor, a0)); g.addColorStop(1, rgba(hor, a1)); return g; };
+  const flood = (y0, y1, a, k = 1) => c => { const g = c.createLinearGradient(0, y0, 0, y1); g.addColorStop(0, `rgba(120,104,92,${(0.16 * a * k).toFixed(3)})`); g.addColorStop(0.55, `rgba(176,142,104,${(0.3 * a * k).toFixed(3)})`); g.addColorStop(1, `rgba(222,172,112,${(0.5 * a * k).toFixed(3)})`); return g; };
+
+  L.A.tint([() => rgba(mix(dark, hor, 0.66))]);
+  L.B.tint([horiz(mix(dark, hor, 0.46), mix(asl, hor, 0.42)), haze(H - 200 * S, H, 0, 0.25)]);
+  L.city.tint([horiz(eu, as), haze(H - 220 * S, H, 0, 0.2)]);
+  L.monu.tint([horiz(mix(eu, hor, 0.06), mix(as, hor, 0.05)), haze(H - 220 * S, H, 0, 0.16), flood(H - 200 * S, H, fl)]);
+  L.near.tint([c => { const g = c.createLinearGradient(0, H2 - 250 * S, 0, H2); g.addColorStop(0, rgba(nl)); g.addColorStop(1, rgba(mix(mul(nl, 0.78), hor, 0.12))); return g; }]);
+  L.nearD.tint([() => rgba(mix(mul(nl, 1.75), [255, 204, 156], 0.4 * sunLit))]);
+  L.nearM.tint([() => rgba(mix(mul(nl, 1.14), hor, 0.04)), flood(H2 - 150 * S, H2, fl, 1.1)]);
+  L.kiz.tint([
+    c => { const g = c.createLinearGradient(0, YK - 90 * S, 0, YK); g.addColorStop(0, rgba(mix(mul(nl, 1.4), [222, 176, 140], 0.5 * sunLit))); g.addColorStop(1, rgba(mix(mul(nl, 0.95), [160, 120, 104], 0.3 * sunLit))); return g; },
+    c => { const g = c.createLinearGradient(0, YK - 90 * S, 0, YK); g.addColorStop(0, `rgba(150,140,128,${(0.3 * flK).toFixed(3)})`); g.addColorStop(1, `rgba(226,186,130,${(0.55 * flK).toFixed(3)})`); return g; },
+  ]);
+  const sx = lerp(0.205, 0.178, clamp(p / 0.4)) * W;
+  for (const cl of clouds) {
+    const pc = clamp(p - cl.hf * 0.07);
+    const cx = cl.x + cl.m.width / 2;
+    const nf = Math.exp(-Math.pow((cx - sx) / (0.42 * W), 2));
+    const col = mix(CF(pc), CN(pc), nf);
+    const g = cl.t.getContext('2d');
+    g.globalCompositeOperation = 'source-over'; g.clearRect(0, 0, cl.t.width, cl.t.height); g.drawImage(cl.m, 0, 0);
+    g.globalCompositeOperation = 'source-in';
+    const gr = g.createLinearGradient(0, 0, 0, cl.t.height);
+    gr.addColorStop(0, rgba(mul(col, 0.8))); gr.addColorStop(1, rgba(mix(col, [255, 238, 216], 0.14 * (1 - night))));
+    g.fillStyle = gr; g.fillRect(0, 0, cl.t.width, cl.t.height);
+    g.globalCompositeOperation = 'source-over';
+  }
+}
+
+/* ───────────────────────── sahne çizimi ───────────────────────── */
+function drawWins(g, wins, p, t) {
+  for (let ci = 0; ci < 5; ci++) {
+    g.fillStyle = rgba(WCOL[ci]);
+    for (const w of wins[ci]) {
+      if (p < w.on) continue;
+      let a = w.a * sstep(w.on, w.on + 0.005, p) * (1 - sstep(w.off, w.off + 0.004, p));
+      if (w.fl && p - w.on < 0.012) a *= Math.sin(t * 31 + w.ph) + Math.sin(t * 17 + w.ph * 3) > 0.3 ? 1 : 0.12;
+      if (a < 0.01) continue;
+      g.globalAlpha = a; g.fillRect(w.x, w.y, w.w, w.h);
+    }
+  }
+  g.globalAlpha = 1;
+}
+function drawGlints(g, gl, p, t, big) {
+  const k = 1 - sstep(0.17, 0.33, p);
+  if (k <= 0.01) return;
+  g.fillStyle = 'rgb(255,208,146)';
+  for (const w of gl) {
+    const a = k * w.a * (0.45 + 0.55 * Math.max(0, Math.sin(t * 0.6 + w.ph)));
+    g.globalAlpha = a; g.fillRect(w.x, w.y, w.w, w.h);
+  }
+  if (big) {
+    g.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < gl.length; i += 3) { const w = gl[i]; glow(g, w.x + w.w / 2, w.y + w.h / 2, 7 * S, [255, 190, 120], k * w.a * 0.35 * Math.max(0, Math.sin(t * 0.6 + w.ph))); }
+    g.globalCompositeOperation = 'source-over';
+  }
+  g.globalAlpha = 1;
+}
+function ledColor(t, i) {
+  const v = ((t * 0.035 + i * 0.011) % 1) * LED.length, k = Math.floor(v), f = v - k;
+  return mix(LED[k], LED[(k + 1) % LED.length], f * f * (3 - 2 * f));
+}
+
+function renderScene(p, t) {
+  const g = sceneX;
+  g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+  const top = SKY_T(p), up = SKY_U(p), lo = SKY_L(p), hor = SKY_H(p);
+  const night = sstep(0.45, 0.8, p);
+
+  /* gökyüzü */
+  let gr = g.createLinearGradient(0, 0, 0, H);
+  gr.addColorStop(0, rgba(top)); gr.addColorStop(0.42, rgba(up)); gr.addColorStop(0.8, rgba(lo)); gr.addColorStop(1, rgba(hor));
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+  // doğu tarafı daha serin
+  g.save(); g.translate(W * 1.02, H); g.scale(2.3, 1);
+  gr = g.createRadialGradient(0, 0, 0, 0, 0, H * 0.75);
+  const cool = mix(up, lo, 0.25);
+  gr.addColorStop(0, rgba(cool, 0.5 * (1 - night))); gr.addColorStop(1, rgba(cool, 0));
+  g.fillStyle = gr; g.fillRect(-H * 0.75, -H * 0.75, H * 1.5, H * 0.75); g.restore();
+
+  /* yıldızlar */
+  for (const s of stars) {
+    if (p < s.th) continue;
+    const a = sstep(s.th, s.th + 0.1, p) * s.b * (0.72 + 0.28 * Math.sin(t * s.f + s.ph)) * clamp((H - s.y) / (160 * S));
+    if (a < 0.02) continue;
+    g.globalAlpha = a; g.fillStyle = s.warm ? '#ffe9cf' : '#e8eeff';
+    g.fillRect(s.x, s.y, s.s, s.s);
+  }
+  g.globalAlpha = 1;
+
+  /* güneş */
+  const sp = p / 0.4;
+  const sx = lerp(0.205, 0.178, clamp(sp)) * W, sy = lerp(H - 360 * S, H - 100 * S, sp), sr = 17 * S;
+  sunX = sx;
+  const sunCol = mix([255, 236, 194], [255, 116, 56], sstep(0.02, 0.36, p));
+  g.globalCompositeOperation = 'lighter';
+  const ga = 0.5 * (1 - sstep(0.3, 0.6, p));
+  if (ga > 0.003) {
+    gr = g.createRadialGradient(sx, sy, 0, sx, sy, 600 * S);
+    gr.addColorStop(0, rgba(sunCol, ga)); gr.addColorStop(0.1, rgba(sunCol, ga * 0.5));
+    gr.addColorStop(0.4, rgba(mix(sunCol, lo, 0.5), ga * 0.13)); gr.addColorStop(1, rgba(lo, 0));
+    g.fillStyle = gr; g.fillRect(0, 0, W, H);
+  }
+  const ag = 0.42 * (1 - sstep(0.42, 0.8, p));
+  if (ag > 0.003) {
+    const ac = mix([255, 172, 92], [220, 78, 64], sstep(0.25, 0.6, p));
+    g.save(); g.translate(sx + 30 * S, H - 25 * S); g.scale(3.4, 1);
+    const R0 = 170 * S; gr = g.createRadialGradient(0, 0, 0, 0, 0, R0);
+    gr.addColorStop(0, rgba(ac, ag)); gr.addColorStop(0.5, rgba(ac, ag * 0.33)); gr.addColorStop(1, rgba(ac, 0));
+    g.fillStyle = gr; g.fillRect(-R0, -R0, 2 * R0, R0 + 25 * S); g.restore();
+  }
+  // gece şehir ışığı kirliliği
+  const cg = sstep(0.48, 0.85, p);
+  if (cg > 0.003) {
+    for (const [cx, k] of [[0.22, 1], [0.6, 0.8]]) {
+      g.save(); g.translate(cx * W, H); g.scale(4.5, 1);
+      const R0 = 150 * S; gr = g.createRadialGradient(0, 0, 0, 0, 0, R0);
+      gr.addColorStop(0, `rgba(255,150,80,${(0.13 * cg * k).toFixed(3)})`); gr.addColorStop(1, 'rgba(255,150,80,0)');
+      g.fillStyle = gr; g.fillRect(-R0, -R0, 2 * R0, R0); g.restore();
+    }
+  }
+  g.globalCompositeOperation = 'source-over';
+  if (p < 0.42) {
+    g.save(); g.translate(sx, sy); g.scale(1, lerp(1, 0.9, sstep(0.25, 0.38, p)));
+    gr = g.createRadialGradient(0, 0, 0, 0, 0, sr * 1.3);
+    gr.addColorStop(0, 'rgba(255,252,240,1)'); gr.addColorStop(0.5, rgba(mix([255, 250, 236], sunCol, 0.55)));
+    gr.addColorStop(0.76, rgba(sunCol, 0.96)); gr.addColorStop(1, rgba(sunCol, 0));
+    g.fillStyle = gr; g.beginPath(); g.arc(0, 0, sr * 1.3, 0, TAU); g.fill(); g.restore();
+  }
+
+  /* Venüs kuşağı ve dünyanın gölgesi (doğuda) */
+  const bv = sstep(0.27, 0.4, p) * (1 - sstep(0.46, 0.64, p));
+  if (bv > 0.003) {
+    g.save(); g.translate(0.84 * W, H - 105 * S); g.scale(4.2, 1);
+    let R0 = 105 * S; gr = g.createRadialGradient(0, 0, 0, 0, 0, R0);
+    gr.addColorStop(0, `rgba(228,152,168,${(0.3 * bv).toFixed(3)})`); gr.addColorStop(1, 'rgba(228,152,168,0)');
+    g.fillStyle = gr; g.fillRect(-R0, -R0, 2 * R0, 2 * R0); g.restore();
+    g.save(); g.translate(0.84 * W, H); g.scale(4.5, 1);
+    R0 = 70 * S; gr = g.createRadialGradient(0, 0, 0, 0, 0, R0);
+    gr.addColorStop(0, `rgba(58,66,108,${(0.4 * bv).toFixed(3)})`); gr.addColorStop(1, 'rgba(58,66,108,0)');
+    g.fillStyle = gr; g.fillRect(-R0, -R0, 2 * R0, R0); g.restore();
+  }
+
+  /* hilal ve Venüs */
+  const ma = sstep(0.34, 0.56, p);
+  if (ma > 0.003) {
+    const mx = (0.292 - p * 0.012) * W, my = H - (300 - p * 26) * S;
+    g.globalCompositeOperation = 'lighter';
+    glow(g, mx - 2 * S, my + 2 * S, 70 * S, [150, 160, 200], 0.22 * ma);
+    glow(g, (0.247 - p * 0.012) * W, H - (226 - p * 24) * S, 14 * S, [255, 250, 230], sstep(0.4, 0.52, p) * 0.95);
+    g.globalCompositeOperation = 'source-over';
+    g.globalAlpha = ma; g.drawImage(moonC, mx - moonC.width / 2, my - moonC.height / 2); g.globalAlpha = 1;
+  }
+
+  /* bulutlar */
+  for (const cl of clouds) { g.globalAlpha = 0.88; g.drawImage(cl.t, cl.x, cl.y); }
+  g.globalAlpha = 1;
+
+  /* uzak tepeler */
+  L.A.draw(g);
+  L.B.draw(g);
+  g.globalCompositeOperation = 'lighter';
+  const tsz = Math.max(1, 0.9 * S);
+  for (const l of tinyLights) {
+    if (p < l.on) continue;
+    const a = l.a * sstep(l.on, l.on + 0.01, p) * (0.85 + 0.15 * Math.sin(t * 0.9 + l.ph));
+    g.globalAlpha = a; g.fillStyle = rgba(l.c); g.fillRect(l.x, l.y, tsz, tsz);
+  }
+  g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+
+  /* köprü */
+  drawBridge(g, p, t, mix(mix(DARK(p), hor, 0.4), [120, 120, 130], 0.05), night);
+
+  /* orta plan şehir */
+  L.city.draw(g);
+  drawWins(g, winCity, p, t);
+  drawGlints(g, glintCity, p, t, false);
+  L.monu.draw(g);
+  g.globalCompositeOperation = 'lighter';
+  for (const l of monuLights) glow(g, l.x, l.y, 4 * S, l.c, 0.8 * sstep(l.on, l.on + 0.006, p));
+  for (const l of lampsFar) glow(g, l.x, l.y, 6 * S, l.c, 0.85 * sstep(l.on, l.on + 0.004, p));
+  g.globalCompositeOperation = 'source-over';
+
+  /* kıyı pusu */
+  gr = g.createLinearGradient(0, H - 55 * S, 0, H);
+  gr.addColorStop(0, rgba(hor, 0)); gr.addColorStop(1, rgba(hor, 0.24 * (1 - 0.55 * night)));
+  g.fillStyle = gr; g.fillRect(0, H - 55 * S, W, 55 * S);
+}
+
+function drawBridge(g, p, t, col, night) {
+  const b = bridge;
+  g.fillStyle = rgba(col); g.strokeStyle = rgba(col);
+  const towers = [[b.xL, b.tL], [b.xR, b.tR]];
+  const towerPath = (x, ty) => { g.beginPath(); g.moveTo(x - 2.6 * S, H); g.lineTo(x - 1.6 * S, ty); g.lineTo(x + 1.6 * S, ty); g.lineTo(x + 2.6 * S, H); g.closePath(); };
+  for (const [x, ty] of towers) { towerPath(x, ty); g.fill(); g.fillRect(x - 2.3 * S, ty - 1.3 * S, 4.6 * S, 1.8 * S); }
+  g.beginPath();
+  g.moveTo(b.xa, b.deck(b.xa) - 1.6 * S); g.lineTo(b.xb, b.deck(b.xb) - 1.4 * S);
+  g.lineTo(b.xb, b.deck(b.xb) + 1.6 * S); g.lineTo(b.xa, b.deck(b.xa) + 1.8 * S); g.closePath(); g.fill();
+  g.lineWidth = Math.max(1, 1.1 * S); g.beginPath();
+  for (let x = b.xa; x <= b.xb; x += 3) { const y = b.cable(x); x === b.xa ? g.moveTo(x, y) : g.lineTo(x, y); }
+  g.stroke();
+  g.lineWidth = Math.max(0.5, 0.38 * S); g.globalAlpha = 0.55; g.beginPath();
+  for (const h of b.hangers) { g.moveTo(h[0], h[1]); g.lineTo(h[2], h[3]); }
+  g.stroke(); g.globalAlpha = 1;
+
+  // kuleler gece hafifçe aydınlanır
+  const tl = sstep(0.55, 0.65, p);
+  g.globalCompositeOperation = 'lighter';
+  if (tl > 0) {
+    for (const [x, ty] of towers) {
+      const c = ledColor(t, x === b.xL ? 0 : 63);
+      const gr = g.createLinearGradient(0, ty, 0, b.deck(x));
+      gr.addColorStop(0, rgba(c, 0.32 * tl)); gr.addColorStop(1, rgba(c, 0.08 * tl));
+      g.fillStyle = gr; towerPath(x, ty); g.fill();
+    }
+  }
+  // araçlar
+  const cv = sstep(0.36, 0.52, p);
+  if (cv > 0.01) {
+    for (const c of cars) {
+      const x = lerp(b.xa, b.xb, c.u), y = b.deck(x) - (c.dir > 0 ? 1.3 : 0.7) * S;
+      g.globalAlpha = cv * 0.95; g.fillStyle = '#fff6e0'; g.fillRect(x + c.dir * 1.2 * S - 0.7 * S, y, 1.4 * S, 0.9 * S);
+      g.globalAlpha = cv * 0.8; g.fillStyle = '#ff3a2a'; g.fillRect(x - c.dir * 1.2 * S - 0.6 * S, y, 1.2 * S, 0.8 * S);
+    }
+  }
+  for (const l of b.deckL) glow(g, l.x, l.y, 3.4 * S, [255, 204, 146], 0.7 * sstep(l.on, l.on + 0.004, p));
+  for (const l of b.lights) glow(g, l.x, l.y, 4.6 * S, ledColor(t, l.i), 0.95 * sstep(l.on, l.on + 0.004, p));
+  const blink = (Math.sin(t * 2.2) > 0.25 ? 1 : 0.12) * sstep(0.38, 0.48, p);
+  for (const [x, ty] of towers) glow(g, x, ty - 2 * S, 6 * S, [255, 50, 36], blink);
+  g.globalCompositeOperation = 'source-over'; g.globalAlpha = 1;
+}
+
+function renderNear(p, t) {
+  const g = nearX, night = sstep(0.45, 0.8, p);
+  g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+  g.clearRect(0, 0, nearC.width, nearC.height);
+  g.setTransform(1, 0, 0, 1, -L.near.x0, -L.near.y0);
+  L.near.draw(g);
+  L.nearD.draw(g, 0.5 * (1 - night));
+  drawWins(g, winNear, p, t);
+  drawGlints(g, glintNear, p, t, true);
+  L.nearM.draw(g);
+  g.globalCompositeOperation = 'lighter';
+  for (const l of nearMonuLights) glow(g, l.x, l.y, 6 * S, l.c, 0.85 * sstep(l.on, l.on + 0.006, p));
+  for (const l of lampsNear) glow(g, l.x, l.y, 11 * S, l.c, 0.95 * sstep(l.on, l.on + 0.004, p));
+  g.globalCompositeOperation = 'source-over';
+}
+
+function renderKiz(p, t) {
+  const g = kizX;
+  g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+  g.clearRect(0, 0, kizC.width, kizC.height);
+  g.setTransform(1, 0, 0, 1, -L.kiz.x0, -L.kiz.y0);
+  L.kiz.draw(g);
+  // bayrak
+  const [px, py] = kizGeo.pole, am = AMB(p);
+  g.fillStyle = rgba([196 * am[0] / 255 + 30 * sstep(0.5, 0.6, p), 28 * am[1] / 255, 36 * am[2] / 255]);
+  g.beginPath(); g.moveTo(px, py);
+  const fw = 7.5 * S, fh = 5 * S;
+  for (let i = 0; i <= 8; i++) { const x = px + fw * i / 8; g.lineTo(x, py + Math.sin(t * 4 - i * 0.8) * 0.6 * S * i / 8); }
+  for (let i = 8; i >= 0; i--) { const x = px + fw * i / 8; g.lineTo(x, py + fh + Math.sin(t * 4 - i * 0.8) * 0.6 * S * i / 8); }
+  g.closePath(); g.fill();
+  g.globalCompositeOperation = 'lighter';
+  for (const l of kizLights) glow(g, l.x, l.y, l.r * S, l.c, (l.big ? 1 : 0.8) * sstep(l.on, l.on + 0.006, p));
+  g.globalCompositeOperation = 'source-over';
+}
+
+/* ───────────────────────── su ───────────────────────── */
+function reflect(g, src, ox, oy, baseY, t) {
+  const sh = Math.max(2, Math.round(2 * R)), lb = baseY - oy, sw = src.width;
+  for (let dy = 0; ; dy += sh) {
+    const yy = baseY + dy;
+    if (yy >= HT) break;
+    const d = Math.max(0, (yy - H) / S), q = Math.sqrt(d);
+    const amp = (0.35 + d * 0.022) * S;
+    const dx = amp * (Math.sin(q * 7 + t * 1.4) * 0.7 + Math.sin(q * 2.9 - t * 0.8 + 1.3) * 0.9 + Math.sin(q * 17 + t * 2.2) * 0.35);
+    const jy = Math.sin(q * 11 - t * 1.9) * (0.3 + d * 0.012) * S;
+    const sy = lb - dy - sh + jy;
+    if (sy < 0) break;
+    g.drawImage(src, 0, sy, sw, sh, ox + dx, yy, sw, sh);
+  }
+}
+
+function streak(g, x, my, len, col, a, t, seed) {
+  if (a <= 0.01) return;
+  g.fillStyle = rgba(col);
+  const n = 7;
+  for (let k = 0; k < n; k++) {
+    const f = k / (n - 1), y = my - len * 0.12 + f * len;
+    if (y < H) continue;
+    const fl = 0.5 + 0.5 * Math.sin(t * (2.1 + (seed % 1.3)) + k * 1.9 + seed * 7);
+    const aa = a * (1 - Math.abs(f - 0.25) * 0.95) * fl;
+    if (aa <= 0.01) continue;
+    const w = (1.1 + (1 - Math.abs(f - 0.25)) * 2.4 + fl * 1.4) * S * (0.6 + len / (80 * S));
+    const jx = Math.sin(t * 1.3 + y * 0.05 / S + seed) * (0.8 + f * 2.5) * S;
+    g.globalAlpha = Math.min(1, aa); g.fillRect(x + jx - w / 2, y, w, (0.9 + f * 0.9) * S);
+  }
+}
+
+function drawWater(g, p, t) {
+  const hor = SKY_H(p), up = SKY_U(p), lo = SKY_L(p), night = sstep(0.45, 0.8, p), wc = WATER(p);
+  // yansıma tonlaması
+  let gr = g.createLinearGradient(0, H, 0, HT);
+  gr.addColorStop(0, rgba(wc, 0.14)); gr.addColorStop(0.35, rgba(wc, 0.42)); gr.addColorStop(1, rgba(wc, 0.66));
+  g.fillStyle = gr; g.fillRect(0, H, W, HT - H);
+  // ufuk çizgisi
+  gr = g.createLinearGradient(0, H - 1, 0, H + 4 * S);
+  gr.addColorStop(0, rgba(mix(hor, [255, 255, 255], 0.15), 0.28 * (1 - 0.7 * night))); gr.addColorStop(1, rgba(hor, 0));
+  g.fillStyle = gr; g.fillRect(0, H - 1, W, 4 * S + 1);
+
+  // dalga dokusu
+  const lc = mix(mix(up, lo, 0.45), [255, 255, 255], 0.1), span = HT - H;
+  g.fillStyle = rgba(lc);
+  for (const w of wavesL) {
+    const fl = Math.sin(t * w.f + w.ph);
+    if (fl < 0.1) continue;
+    const k = w.u * w.u, y = H + span * k;
+    const x = ((w.x * W + t * w.dr * 9 * S * (0.3 + k)) % W + W) % W;
+    const len = (3 + k * 58) * S * w.l, th = Math.max(0.6, (0.45 + k * 2.2) * S);
+    g.globalAlpha = fl * (0.07 + 0.2 * (1 - k * 0.5)) * (1 - night * 0.55);
+    g.fillRect(x - len / 2, y, len, th);
+  }
+  g.fillStyle = rgba(mul(wc, 0.4));
+  for (const w of wavesD) {
+    const fl = Math.sin(t * w.f + w.ph);
+    if (fl < 0) continue;
+    const k = w.u * w.u, y = H + span * k;
+    const x = ((w.x * W - t * w.dr * 9 * S * (0.3 + k)) % W + W) % W;
+    const len = (4 + k * 70) * S * w.l, th = Math.max(0.6, (0.6 + k * 3) * S);
+    g.globalAlpha = fl * 0.3;
+    g.fillRect(x - len / 2, y, len, th);
+  }
+  g.globalAlpha = 1;
+
+  g.globalCompositeOperation = 'lighter';
+  // güneş pırıltısı
+  const sp = p / 0.4, sy = lerp(H - 360 * S, H - 100 * S, sp), sr = 17 * S;
+  const ridgeTop = H - Math.max(P.back(sunX / W), P.eu(sunX / W)) * S;
+  const vis = clamp((ridgeTop - (sy - sr)) / (2 * sr));
+  if (vis > 0.01) {
+    const sunCol = mix([255, 240, 205], [255, 140, 70], sstep(0.02, 0.36, p));
+    const y0 = H + (H - ridgeTop) + 2 * S, ym = 2 * H - sy;
+    g.fillStyle = rgba(mix(sunCol, [255, 255, 255], 0.3));
+    for (const s of glitter) {
+      const y = lerp(y0, HT, Math.pow(s.u, 1.3));
+      const fl = Math.sin(t * s.f + s.ph);
+      if (fl < 0.4) continue;
+      const I = (0.3 + 0.7 * Math.exp(-Math.pow((y - ym) / (70 * S), 2))) * vis * Math.pow(fl, 4);
+      const spread = 6 * S + (y - H) * 0.22;
+      const x = sunX + s.v * spread * 0.5;
+      const len = (2 + (y - H) / S * 0.07) * S * s.l;
+      g.globalAlpha = I * 0.85;
+      g.fillRect(x - len / 2, y, len, Math.max(0.7, (0.5 + (y - H) / S * 0.006) * S));
+    }
+  }
+  // ışık süzmeleri
+    for (const l of lampsFar) streak(g, l.x, 2 * H - l.y, 30 * S, l.c, 0.95 * sstep(l.on, l.on + 0.004, p), t, l.x * 0.013);
+  for (const l of bridge.lights) if (l.vis) streak(g, l.x, 2 * H - l.y, 24 * S, ledColor(t, l.i), 0.55 * sstep(l.on, l.on + 0.004, p), t, l.i * 0.37);
+  for (let i = 0; i < bridge.deckL.length; i += 2) { const l = bridge.deckL[i]; if (l.vis) streak(g, l.x, 2 * H - l.y, 22 * S, [255, 204, 146], 0.22 * sstep(l.on, l.on + 0.004, p), t, i * 0.71); }
+  for (const l of monuLights) streak(g, l.x, 2 * H - l.y, 20 * S, l.c, 0.18 * sstep(l.on, l.on + 0.006, p), t, l.x * 0.02);
+  for (const l of kizLights) streak(g, l.x, 2 * YK - l.y, (l.big ? 60 : 36) * S, l.c, (l.big ? 0.55 : 0.35) * sstep(l.on, l.on + 0.006, p), t, l.y * 0.03);
+  for (const l of nearMonuLights) streak(g, l.x, 2 * H2 - l.y, 50 * S, l.c, 0.3 * sstep(l.on, l.on + 0.006, p), t, l.x * 0.017);
+  for (const l of lampsNear) streak(g, l.x, 2 * H2 - l.y, 85 * S, l.c, 0.85 * sstep(l.on, l.on + 0.004, p), t, l.x * 0.011);
+  g.globalCompositeOperation = 'source-over'; g.globalAlpha = 1;
+}
+
+/* ───────────────────────── vapur ───────────────────────── */
+function paintVapur(v, p) {
+  const g = v.g, Lx = v.L, cw = v.c.width, ch = v.c.height;
+  g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, cw, ch);
+  g.setTransform(v.dir, 0, 0, 1, cw / 2, ch - 1);
+  const am = AMB(p).map(c => c / 255);
+  const lit = (c, k = 1) => rgba([c[0] * am[0] * k, c[1] * am[1] * k, c[2] * am[2] * k]);
+  const nw = sstep(0.4, 0.52, p);
+  g.fillStyle = lit([36, 38, 50]);
+  g.beginPath(); g.moveTo(-0.47 * Lx, 0); g.lineTo(-0.5 * Lx, -0.02 * Lx); g.lineTo(-0.515 * Lx, -0.082 * Lx);
+  g.lineTo(0.42 * Lx, -0.082 * Lx); g.quadraticCurveTo(0.5 * Lx, -0.086 * Lx, 0.535 * Lx, -0.1 * Lx); g.lineTo(0.47 * Lx, 0); g.closePath(); g.fill();
+  g.fillStyle = lit([222, 216, 204]); g.fillRect(-0.51 * Lx, -0.082 * Lx, 0.95 * Lx, 0.012 * Lx);
+  g.fillStyle = lit([232, 224, 206]);
+  g.fillRect(-0.41 * Lx, -0.142 * Lx, 0.78 * Lx, 0.062 * Lx);
+  g.fillRect(-0.3 * Lx, -0.19 * Lx, 0.52 * Lx, 0.05 * Lx);
+  g.fillRect(0.12 * Lx, -0.226 * Lx, 0.13 * Lx, 0.038 * Lx);
+  g.fillStyle = lit([200, 192, 178], 0.75);
+  g.fillRect(-0.42 * Lx, -0.145 * Lx, 0.8 * Lx, 0.005 * Lx); g.fillRect(-0.31 * Lx, -0.193 * Lx, 0.54 * Lx, 0.005 * Lx); g.fillRect(0.11 * Lx, -0.229 * Lx, 0.15 * Lx, 0.005 * Lx);
+  const rows = [[-0.38, 0.33, -0.129, 0.02, 0.038], [-0.27, 0.19, -0.179, 0.017, 0.04], [0.135, 0.235, -0.219, 0.014, 0.027]];
+  for (const [a, b, y, h, st] of rows) for (let x = a; x <= b; x += st) {
+    g.globalAlpha = 1; g.fillStyle = lit([58, 62, 78]); g.fillRect(x * Lx, y * Lx, st * 0.55 * Lx, h * Lx);
+    if (nw > 0) { g.globalAlpha = nw * 0.95; g.fillStyle = 'rgb(255,208,146)'; g.fillRect(x * Lx, y * Lx, st * 0.55 * Lx, h * Lx); }
+  }
+  g.globalAlpha = 1;
+  g.fillStyle = lit([226, 212, 186]);
+  g.beginPath(); g.moveTo(-0.08 * Lx, -0.19 * Lx); g.lineTo(-0.108 * Lx, -0.305 * Lx); g.lineTo(-0.036 * Lx, -0.305 * Lx); g.lineTo(-0.008 * Lx, -0.19 * Lx); g.closePath(); g.fill();
+  g.fillStyle = lit([24, 24, 30]);
+  g.beginPath(); g.moveTo(-0.1015 * Lx, -0.278 * Lx); g.lineTo(-0.108 * Lx, -0.305 * Lx); g.lineTo(-0.036 * Lx, -0.305 * Lx); g.lineTo(-0.0295 * Lx, -0.278 * Lx); g.closePath(); g.fill();
+  g.fillStyle = lit([60, 60, 66]);
+  g.fillRect(0.3 * Lx, -0.33 * Lx, Math.max(1, 0.006 * Lx), 0.106 * Lx);
+  g.fillRect(-0.45 * Lx, -0.2 * Lx, Math.max(1, 0.004 * Lx), 0.06 * Lx);
+}
+
+function drawVapur(g, v, p, t) {
+  const night = sstep(0.45, 0.8, p);
+  paintVapur(v, p);
+  const cw = v.c.width, ch = v.c.height, x0 = v.x - cw / 2, y0 = v.by - ch + 1;
+  // köpük izi
+  g.fillStyle = rgba(mix(SKY_H(p), [255, 255, 255], 0.55));
+  for (const w of v.wake) {
+    const a = (1 - w.age / 14) * (0.16 - night * 0.08);
+    if (a <= 0) continue;
+    const sp = w.age * 1.1 * S;
+    const len = (0.03 * v.L + w.age * 1.5 * S);
+    g.globalAlpha = a * (0.6 + 0.4 * Math.sin(t * 3 + w.ph));
+    g.fillRect(w.x - len / 2, v.by + 0.8 * S + sp * 0.35, len, Math.max(0.7, 0.8 * S));
+    g.globalAlpha = a * 0.6;
+    g.fillRect(w.x - len * 0.35 + w.age * 0.6 * S * -v.dir, v.by + 0.6 * S, len * 0.7, Math.max(0.7, 0.6 * S));
+  }
+  // yansıma
+  const sh = Math.max(2, Math.round(2 * R));
+  for (let dy = 0; dy < ch; dy += sh) {
+    const sy = ch - 1 - dy - sh; if (sy < 0) break;
+    const d = (v.by + dy - H) / S, q = Math.sqrt(Math.max(0, d));
+    const dx = (0.35 + d * 0.022) * S * (Math.sin(q * 7 + t * 1.4) * 0.7 + Math.sin(q * 17 + t * 2.2) * 0.4);
+    g.globalAlpha = 0.42 * (1 - dy / ch * 0.6);
+    g.drawImage(v.c, 0, sy, cw, sh, x0 + dx, v.by + dy, cw, sh);
+  }
+  g.globalAlpha = 1;
+  g.drawImage(v.c, x0, y0);
+  // pruva dalgası
+  g.fillStyle = 'rgba(240,236,228,0.35)';
+  g.globalAlpha = 1 - night * 0.6;
+  g.fillRect(v.x + v.dir * 0.42 * v.L - 0.05 * v.L, v.by - 0.3 * S, 0.09 * v.L, Math.max(0.8, 0.9 * S));
+  g.globalAlpha = 1;
+  // seyir fenerleri
+  const nl = sstep(0.4, 0.5, p);
+  if (nl > 0) {
+    g.globalCompositeOperation = 'lighter';
+    const k = v.L / (150 * S);
+    glow(g, v.x + v.dir * 0.303 * v.L, v.by - 0.333 * v.L, 7 * S * k, [255, 250, 235], nl);
+    glow(g, v.x + v.dir * 0.2 * v.L, v.by - 0.205 * v.L, 6 * S * k, v.dir > 0 ? [80, 255, 140] : [255, 60, 50], nl * 0.9);
+    glow(g, v.x - v.dir * 0.448 * v.L, v.by - 0.2 * v.L, 5 * S * k, [255, 240, 220], nl * 0.7);
+    g.globalCompositeOperation = 'source-over';
+  }
+  // duman
+  const am = AMB(p);
+  for (const s of v.smoke) {
+    g.globalAlpha = Math.max(0, s.a) * 0.16 * (1 - night * 0.65);
+    g.fillStyle = rgba(mul(am, 0.62));
+    g.beginPath(); g.arc(s.x, s.y, s.r, 0, TAU); g.fill();
+  }
+  g.globalAlpha = 1;
+}
+
+/* ───────────────────────── martılar ───────────────────────── */
+function drawGull(g, x, y, s, a) {
+  const wy = -a * 0.42 * s, ty = -a * 0.78 * s + 0.12 * s;
+  g.beginPath();
+  g.moveTo(x - 0.06 * s, y);
+  g.quadraticCurveTo(x - 0.28 * s, y + wy - 0.1 * s, x - 0.47 * s, y + wy);
+  g.quadraticCurveTo(x - 0.76 * s, y + (wy + ty) / 2 - 0.04 * s, x - 1.0 * s, y + ty);
+  g.quadraticCurveTo(x - 0.72 * s, y + (wy + ty) / 2 + 0.1 * s, x - 0.44 * s, y + wy + 0.13 * s);
+  g.quadraticCurveTo(x - 0.24 * s, y + wy * 0.5 + 0.13 * s, x - 0.05 * s, y + 0.09 * s);
+  g.lineTo(x + 0.05 * s, y + 0.09 * s);
+  g.quadraticCurveTo(x + 0.24 * s, y + wy * 0.5 + 0.13 * s, x + 0.44 * s, y + wy + 0.13 * s);
+  g.quadraticCurveTo(x + 0.72 * s, y + (wy + ty) / 2 + 0.1 * s, x + 1.0 * s, y + ty);
+  g.quadraticCurveTo(x + 0.76 * s, y + (wy + ty) / 2 - 0.04 * s, x + 0.47 * s, y + wy);
+  g.quadraticCurveTo(x + 0.28 * s, y + wy - 0.1 * s, x + 0.06 * s, y);
+  g.closePath(); g.fill();
+  g.beginPath(); g.ellipse(x, y + 0.04 * s, 0.17 * s, 0.055 * s, 0, 0, TAU); g.fill();
+}
+
+/* ───────────────────────── güncelleme ───────────────────────── */
+function update(dt, t, p) {
+  for (const cl of clouds) { cl.x += cl.sp * dt; if (cl.x > W + 20 * S) cl.x = -cl.m.width; }
+  for (const c of cars) { c.u += c.dir * c.sp * dt; if (c.u > 1) c.u -= 1; if (c.u < 0) c.u += 1; }
+  for (const v of vapurs) {
+    v.x += v.dir * v.sp * dt;
+    if (v.dir > 0 && v.x > W + v.L) { v.x = -v.L * 0.7; v.wake = []; v.smoke = []; }
+    if (v.dir < 0 && v.x < -v.L) { v.x = W + v.L * 0.7; v.wake = []; v.smoke = []; }
+    v.st -= dt;
+    if (v.st <= 0) {
+      v.st = 0.25 + Math.random() * 0.25;
+      v.smoke.push({ x: v.x - v.dir * 0.075 * v.L, y: v.by - 0.31 * v.L, r: 0.018 * v.L, a: 1, vx: (2 + Math.random() * 2) * S, vy: -(3 + Math.random() * 2) * S * v.L / (150 * S) });
+    }
+    for (const s of v.smoke) { s.x += s.vx * dt; s.y += s.vy * dt; s.r += dt * 0.011 * v.L; s.a -= dt / 7; }
+    if (v.smoke.length && v.smoke[0].a <= 0) v.smoke.shift();
+    v.wt -= dt;
+    if (v.wt <= 0) { v.wt = 0.07; v.wake.push({ x: v.x - v.dir * 0.46 * v.L, age: 0, ph: Math.random() * TAU }); }
+    for (const w of v.wake) w.age += dt;
+    while (v.wake.length && v.wake[0].age > 14) v.wake.shift();
+  }
+  for (const gl of gulls) {
+    const s = (7 + 24 * gl.z) * S;
+    gl.x += gl.dir * (14 + 34 * gl.z) * S * dt;
+    if (gl.x > W + 2 * s) { gl.x = -2 * s; gl.y0 = H - (90 + Math.random() * 330) * S; }
+    if (gl.x < -2 * s) { gl.x = W + 2 * s; gl.y0 = H - (90 + Math.random() * 330) * S; }
+    gl.ft -= dt;
+    if (gl.ft <= 0) { gl.flapping = !gl.flapping; gl.ft = gl.flapping ? 1 + Math.random() * 1.6 : 2.5 + Math.random() * 5; }
+    gl.fl += ((gl.flapping ? 1 : 0) - gl.fl) * Math.min(1, dt * 3);
+    gl.fp += dt * (7.5 - gl.z * 2.5);
+  }
+  if (!shooting && p > 0.82 && Math.random() < dt / 16) {
+    const a = 0.35 + Math.random() * 0.4;
+    shooting = { x: (0.15 + Math.random() * 0.7) * W, y: (0.05 + Math.random() * 0.3) * H, vx: Math.cos(a) * 520 * S * (Math.random() < 0.5 ? -1 : 1), vy: Math.sin(a) * 520 * S, life: 0 };
+  }
+  if (shooting) { shooting.life += dt; shooting.x += shooting.vx * dt; shooting.y += shooting.vy * dt; if (shooting.life > 0.9) shooting = null; }
+}
+
+/* ───────────────────────── ana döngü ───────────────────────── */
+let sim = 0, last = performance.now(), fast = false;
+const titleEl = document.getElementById('title'), hintEl = document.getElementById('hint');
+function showTitle() {
+  titleEl.style.opacity = 1; hintEl.style.opacity = 1;
+  clearTimeout(showTitle.t1); clearTimeout(showTitle.t2);
+  showTitle.t1 = setTimeout(() => titleEl.style.opacity = 0, 7000);
+  showTitle.t2 = setTimeout(() => hintEl.style.opacity = 0, 9000);
+}
+
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  sim += dt * (fast ? 14 : 1);
+  const p = clamp(sim / DURATION), t = now / 1000;
+  update(dt, t, p);
+  if (lastTint < 0 || Math.abs(p - lastTint) > 0.0012) { retint(p); lastTint = p; }
+
+  renderScene(p, t);
+  renderNear(p, t);
+  renderKiz(p, t);
+
+  const g = ctx;
+  g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+  g.drawImage(sceneC, 0, 0);
+  g.fillStyle = rgba(SKY_H(p)); g.fillRect(0, H, W, HT - H);
+  reflect(g, sceneC, 0, 0, H, t);
+  reflect(g, kizC, L.kiz.x0, L.kiz.y0, YK, t);
+  reflect(g, nearC, L.near.x0, L.near.y0, H2, t);
+  drawWater(g, p, t);
+  for (const v of vapurs) drawVapur(g, v, p, t);
+  g.drawImage(kizC, L.kiz.x0, L.kiz.y0);
+  g.drawImage(nearC, L.near.x0, L.near.y0);
+
+  // martılar
+  const night = sstep(0.45, 0.8, p);
+  g.fillStyle = rgba(mix([40, 34, 42], [128, 118, 122], night * 0.65));
+  for (const gl of gulls) {
+    const vis = gl.night ? 1 : 1 - sstep(0.55, 0.8, p);
+    if (vis <= 0.01) continue;
+    const s = (7 + 24 * gl.z) * S;
+    const y = gl.y0 + Math.sin(t * 0.21 + gl.ph) * 30 * S * (0.4 + gl.z) + Math.sin(t * 0.53 + gl.ph2) * 8 * S;
+    const a = lerp(0.24 + 0.07 * Math.sin(t * 1.3 + gl.ph), Math.sin(gl.fp) * 0.85, gl.fl);
+    g.globalAlpha = vis * (0.55 + 0.4 * gl.z) * (1 - night * 0.4);
+    drawGull(g, gl.x, y, s, a);
+  }
+  g.globalAlpha = 1;
+
+  // kayan yıldız
+  if (shooting) {
+    const s = shooting, k = Math.sin(Math.PI * s.life / 0.9);
+    const gr = g.createLinearGradient(s.x, s.y, s.x - s.vx * 0.18, s.y - s.vy * 0.18);
+    gr.addColorStop(0, `rgba(255,255,255,${(0.85 * k).toFixed(3)})`); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.strokeStyle = gr; g.lineWidth = Math.max(1, 1.1 * S);
+    g.beginPath(); g.moveTo(s.x, s.y); g.lineTo(s.x - s.vx * 0.18, s.y - s.vy * 0.18); g.stroke();
+  }
+
+  g.drawImage(vigC, 0, 0);
+  requestAnimationFrame(frame);
+}
+
+/* ───────────────────────── olaylar ───────────────────────── */
+let rt;
+addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(build, 200); });
+addEventListener('click', () => { sim = 0; lastTint = -1; showTitle(); });
+addEventListener('keydown', e => { if (e.key === 'ArrowRight') fast = true; });
+addEventListener('keyup', e => { if (e.key === 'ArrowRight') fast = false; });
+const q = new URLSearchParams(location.search);
+if (q.has('t')) sim = clamp(parseFloat(q.get('t')) || 0) * DURATION;   // ör. ?t=0.6
+
+build();
+showTitle();
+requestAnimationFrame(t => { last = t; frame(t); });
+})();
+</script>
+</body>
+</html>

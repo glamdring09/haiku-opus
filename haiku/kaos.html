@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kaos · 50 Çift Sarkaç</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #07080d;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #8b93a7;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: pointer; }
+  #hud {
+    position: fixed; left: 22px; top: 20px; pointer-events: none;
+    font-size: 13px; line-height: 1.75; letter-spacing: .02em;
+  }
+  #hud .title {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .24em;
+    color: #5b6378; margin-bottom: 6px;
+  }
+  #hud b { color: #e6ebf5; font-weight: 600; font-variant-numeric: tabular-nums; }
+  #hint {
+    position: fixed; right: 22px; bottom: 18px; font-size: 11px;
+    letter-spacing: .08em; color: #4a5164; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div class="title">Kaos · 50 çift sarkaç</div>
+  <div>Geçen süre: <b id="time">0.00 s</b></div>
+  <div>Toplam enerji (T+V): <b id="energy">—</b> J</div>
+  <div>Enerji sapması: <b id="drift">0.0000</b> J</div>
+</div>
+<div id="hint">tıkla → yeni başlangıç açısı</div>
+
+<script>
+'use strict';
+
+// ---- Sabitler ------------------------------------------------------------
+const N        = 50;        // sarkaç çifti sayısı
+const EPS      = 1e-6;      // komşu başlangıç açıları arası fark (rad)
+const G        = 9.81;      // yerçekimi (m/s²)
+const M1 = 1, M2 = 1;       // kütleler (kg)
+const L1 = 1, L2 = 1;       // kol uzunlukları (m)
+const DT       = 0.001;     // sabit sayısal adım (s)
+const MAX_FRAME = 0.05;     // bir karede en fazla simüle edilecek gerçek süre (s)
+const TRAIL    = 240;       // iz tamponu uzunluğu (kare)
+const CHUNK    = 5;         // iz çizgisi gruplama (alfa kademeleri için)
+
+// ---- Durum ----------------------------------------------------------------
+// Her sarkaç için [θ1, ω1, θ2, ω2]; düz dizide 4*i ofsetinde.
+const st = new Float64Array(N * 4);
+// İz tamponları: her sarkaç için uç noktaların (x,y) geçmişi.
+const tipA = new Float32Array(N * TRAIL * 2); // 1. kütle
+const tipB = new Float32Array(N * TRAIL * 2); // 2. kütle
+let head = 0, count = 0;
+let simT = 0, acc = 0, E0 = 0;
+let last = performance.now();
+
+// ---- Fizik ----------------------------------------------------------------
+// Çift sarkacın hareket denklemleri (θ dikey aşağıdan ölçülür):
+//   θ1'' = [ -g(2m1+m2) sinθ1 - m2 g sin(θ1-2θ2) - 2 sin(θ1-θ2) m2 (ω2² L2 + ω1² L1 cos(θ1-θ2)) ]
+//          / [ L1 (2m1+m2 - m2 cos(2θ1-2θ2)) ]
+//   θ2'' = [ 2 sin(θ1-θ2) ((m1+m2)(ω1² L1 + g cosθ1) + ω2² L2 m2 cos(θ1-θ2)) ]
+//          / [ L2 (2m1+m2 - m2 cos(2θ1-2θ2)) ]
+const y = new Float64Array(4), yTmp = new Float64Array(4);
+const k1 = new Float64Array(4), k2 = new Float64Array(4);
+const k3 = new Float64Array(4), k4 = new Float64Array(4);
+
+function deriv(y, o) {
+  const t1 = y[0], w1 = y[1], t2 = y[2], w2 = y[3];
+  const d  = t1 - t2;
+  const sd = Math.sin(d), cd = Math.cos(d);
+  const den = 2 * M1 + M2 - M2 * Math.cos(2 * d);
+  o[0] = w1;
+  o[1] = (-G * (2 * M1 + M2) * Math.sin(t1)
+          - M2 * G * Math.sin(t1 - 2 * t2)
+          - 2 * sd * M2 * (w2 * w2 * L2 + w1 * w1 * L1 * cd)) / (L1 * den);
+  o[2] = w2;
+  o[3] = (2 * sd * ((M1 + M2) * (w1 * w1 * L1 + G * Math.cos(t1))
+          + w2 * w2 * L2 * M2 * cd)) / (L2 * den);
+}
+
+// Klasik RK4 — kısa adımda enerji sapması çok küçük kalır ve patlamaz.
+function rk4(i, h) {
+  const b = i * 4;
+  for (let j = 0; j < 4; j++) y[j] = st[b + j];
+  deriv(y, k1);
+  for (let j = 0; j < 4; j++) yTmp[j] = y[j] + 0.5 * h * k1[j];
+  deriv(yTmp, k2);
+  for (let j = 0; j < 4; j++) yTmp[j] = y[j] + 0.5 * h * k2[j];
+  deriv(yTmp, k3);
+  for (let j = 0; j < 4; j++) yTmp[j] = y[j] + h * k3[j];
+  deriv(yTmp, k4);
+  for (let j = 0; j < 4; j++)
+    st[b + j] = y[j] + (h / 6) * (k1[j] + 2 * k2[j] + 2 * k3[j] + k4[j]);
+}
+
+// Toplam mekanik enerji: T + V
+function energy(i) {
+  const b = i * 4;
+  const t1 = st[b], w1 = st[b + 1], t2 = st[b + 2], w2 = st[b + 3];
+  const T = 0.5 * (M1 + M2) * L1 * L1 * w1 * w1
+          + 0.5 * M2 * L2 * L2 * w2 * w2
+          + M2 * L1 * L2 * w1 * w2 * Math.cos(t1 - t2);
+  const V = -(M1 + M2) * G * L1 * Math.cos(t1) - M2 * G * L2 * Math.cos(t2);
+  return T + V;
+}
+
+// ---- Başlangıç --------------------------------------------------------------
+function randomStart() {
+  // Yüksek enerjili, kaotik rejimde kalmak için büyük açılar seç.
+  const s1 = Math.random() < 0.5 ? -1 : 1;
+  const s2 = Math.random() < 0.5 ? -1 : 1;
+  const th1 = s1 * (1.2 + Math.random() * 1.8);
+  const th2 = s2 * (1.2 + Math.random() * 1.8);
+  return [th1, th2];
+}
+
+function reset() {
+  const [th1, th2] = randomStart();
+  for (let i = 0; i < N; i++) {
+    const b = i * 4;
+    st[b]     = th1 + i * EPS; // her sarkaç bir öncekinden 1e-6 rad farklı
+    st[b + 1] = 0;
+    st[b + 2] = th2;
+    st[b + 3] = 0;
+  }
+  E0 = energy(0);
+  simT = 0; acc = 0;
+  head = 0; count = 0;
+  tipA.fill(0); tipB.fill(0);
+}
+
+// ---- Çizim ----------------------------------------------------------------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, S = 1, OX = 0, OY = 0, dpr = 1;
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  S = Math.min(W, H) * 0.22;      // 1 m'nin piksel karşılığı
+  OX = W / 2;
+  OY = H * 0.36;                   // asılma noktası
+}
+
+// Bir iz çizgisini (ring buffer) soluklaşan parçalar halinde çiz.
+function drawTrail(buf, i, hue, maxAlpha, lw) {
+  const base = i * TRAIL * 2;
+  const start = (head - count + TRAIL) % TRAIL;
+  ctx.lineWidth = lw;
+  for (let j = 1; j < count; j += CHUNK) {
+    const end = Math.min(j + CHUNK, count);
+    const a = maxAlpha * Math.pow(j / count, 1.6); // eski = soluk, yeni = parlak
+    ctx.strokeStyle = `hsla(${hue},90%,64%,${a.toFixed(3)})`;
+    ctx.beginPath();
+    let p = (start + j - 1) % TRAIL;
+    ctx.moveTo(buf[base + p * 2], buf[base + p * 2 + 1]);
+    for (let k = j; k < end; k++) {
+      p = (start + k) % TRAIL;
+      ctx.lineTo(buf[base + p * 2], buf[base + p * 2 + 1]);
+    }
+    ctx.stroke();
+  }
+}
+
+function draw() {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#07080d';
+  ctx.fillRect(0, 0, W, H);
+
+  // İzler: toplamsal karışım, parlak bir "ışık" hissi verir.
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (let i = 0; i < N; i++) {
+    const hue = (i / (N - 1)) * 280;  // kırmızıdan mora bir yelpaze
+    drawTrail(tipA, i, hue, 0.22, 1);
+    drawTrail(tipB, i, hue, 0.55, 1.6);
+  }
+
+  // Çubuklar ve kütleler
+  ctx.globalCompositeOperation = 'source-over';
+  for (let i = 0; i < N; i++) {
+    const b = i * 4;
+    const t1 = st[b], t2 = st[b + 2];
+    const x1 = OX + S * L1 * Math.sin(t1);
+    const y1 = OY + S * L1 * Math.cos(t1);
+    const x2 = x1 + S * L2 * Math.sin(t2);
+    const y2 = y1 + S * L2 * Math.cos(t2);
+    const hue = (i / (N - 1)) * 280;
+
+    ctx.strokeStyle = `hsla(${hue},80%,70%,0.22)`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(OX, OY);
+    ctx.lineTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+
+    ctx.fillStyle = `hsla(${hue},90%,68%,0.9)`;
+    ctx.beginPath();
+    ctx.arc(x2, y2, 2.6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Asılma noktası
+  ctx.fillStyle = '#c9d1e0';
+  ctx.beginPath();
+  ctx.arc(OX, OY, 3, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// Her karede uç noktaları iz tamponuna yaz.
+function recordTips() {
+  for (let i = 0; i < N; i++) {
+    const b = i * 4;
+    const t1 = st[b], t2 = st[b + 2];
+    const x1 = OX + S * L1 * Math.sin(t1);
+    const y1 = OY + S * L1 * Math.cos(t1);
+    const x2 = x1 + S * L2 * Math.sin(t2);
+    const y2 = y1 + S * L2 * Math.cos(t2);
+    const p = (i * TRAIL + head) * 2;
+    tipA[p] = x1; tipA[p + 1] = y1;
+    tipB[p] = x2; tipB[p + 1] = y2;
+  }
+  head = (head + 1) % TRAIL;
+  if (count < TRAIL) count++;
+}
+
+// ---- HUD ------------------------------------------------------------------
+const elTime = document.getElementById('time');
+const elE = document.getElementById('energy');
+const elDrift = document.getElementById('drift');
+
+function updateHud() {
+  const E = energy(0);
+  elTime.textContent = simT.toFixed(2) + ' s';
+  elE.textContent = E.toFixed(4);
+  elDrift.textContent = (E - E0 >= 0 ? '+' : '') + (E - E0).toFixed(6);
+}
+
+// ---- Döngü ----------------------------------------------------------------
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > MAX_FRAME) dt = MAX_FRAME;   // sekme arka plandayken sıçramayı engelle
+  acc += dt;
+  while (acc >= DT) {
+    for (let i = 0; i < N; i++) rk4(i, DT);
+    simT += DT;
+    acc -= DT;
+  }
+  recordTips();
+  draw();
+  updateHud();
+  requestAnimationFrame(frame);
+}
+
+canvas.addEventListener('click', () => { reset(); });
+window.addEventListener('resize', resize);
+
+resize();
+reset();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kaos · 50 Çift Sarkaç</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #05060a; color: #d8dbe6;
+    font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    cursor: pointer; user-select: none;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  .hud {
+    position: fixed; top: 28px; left: 32px; pointer-events: none;
+    letter-spacing: .02em;
+  }
+  .hud h1 {
+    margin: 0 0 4px; font-weight: 300; font-size: 13px;
+    letter-spacing: .5em; text-transform: uppercase; color: #fff;
+  }
+  .hud .sub { font-size: 12px; color: #6d7388; margin-bottom: 22px; }
+  .row { display: flex; align-items: baseline; gap: 14px; margin: 6px 0; }
+  .lbl {
+    width: 92px; font-size: 10px; letter-spacing: .18em;
+    text-transform: uppercase; color: #5d6378;
+  }
+  .val {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 15px; color: #eef0f7; font-variant-numeric: tabular-nums;
+  }
+  .val.small { font-size: 12px; color: #9aa0b4; }
+  .state {
+    display: inline-block; margin-top: 16px; padding: 4px 10px;
+    border: 1px solid #2a2e3c; border-radius: 999px;
+    font-size: 10px; letter-spacing: .22em; text-transform: uppercase;
+    color: #aab0c4; transition: color .6s, border-color .6s;
+  }
+  .hint {
+    position: fixed; bottom: 26px; left: 0; right: 0; text-align: center;
+    font-size: 11px; letter-spacing: .3em; text-transform: uppercase;
+    color: #3d4254; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="hud">
+  <h1>Kaos</h1>
+  <div class="sub">50 çift sarkaç · Δθ = 10⁻⁶ rad</div>
+  <div class="row"><span class="lbl">Süre</span><span class="val" id="t">0.00 s</span></div>
+  <div class="row"><span class="lbl">Toplam enerji</span><span class="val" id="e">—</span></div>
+  <div class="row"><span class="lbl">Enerji sapması</span><span class="val small" id="de">—</span></div>
+  <div class="row"><span class="lbl">Başlangıç</span><span class="val small" id="init">—</span></div>
+  <div class="row"><span class="lbl">Ayrışma</span><span class="val small" id="sp">—</span></div>
+  <div class="state" id="state">senkron</div>
+</div>
+<div class="hint">yeni başlangıç için tıkla</div>
+
+<script>
+"use strict";
+
+// ---------- Fizik sabitleri (SI) ----------
+const N  = 50;          // sarkaç sayısı
+const G  = 9.81;        // m/s²
+const L1 = 1.0, L2 = 1.0;   // çubuk uzunlukları (m)
+const M1 = 1.0, M2 = 1.0;   // kütleler (kg)
+const DT = 1 / 2000;    // sabit RK4 adımı (s)
+const EPS = 1e-6;       // komşu sarkaçlar arası açı farkı (rad)
+const TRAIL = 120;      // iz uzunluğu (kare)
+
+const th1 = new Float64Array(N), th2 = new Float64Array(N);
+const om1 = new Float64Array(N), om2 = new Float64Array(N);
+let simTime = 0, E0 = 1, acc = 0, init1 = 0, init2 = 0;
+
+// Lagrange denklemlerinden türetilen gerçek çift sarkaç hareket denklemleri.
+let A1 = 0, A2 = 0;
+function accel(t1, t2, w1, w2) {
+  const d = t1 - t2, sd = Math.sin(d), cd = Math.cos(d);
+  const den = 2 * M1 + M2 - M2 * Math.cos(2 * d);
+  A1 = (-G * (2 * M1 + M2) * Math.sin(t1)
+        - M2 * G * Math.sin(t1 - 2 * t2)
+        - 2 * sd * M2 * (w2 * w2 * L2 + w1 * w1 * L1 * cd)) / (L1 * den);
+  A2 = (2 * sd * (w1 * w1 * L1 * (M1 + M2)
+        + G * (M1 + M2) * Math.cos(t1)
+        + w2 * w2 * L2 * M2 * cd)) / (L2 * den);
+}
+
+// Klasik 4. derece Runge–Kutta, tek adım.
+function step(i) {
+  const t1 = th1[i], t2 = th2[i], w1 = om1[i], w2 = om2[i], h = DT / 2;
+
+  accel(t1, t2, w1, w2);
+  const a1 = A1, b1 = A2;
+
+  const v1b = w1 + h * a1, v2b = w2 + h * b1;
+  accel(t1 + h * w1, t2 + h * w2, v1b, v2b);
+  const a2 = A1, b2 = A2;
+
+  const v1c = w1 + h * a2, v2c = w2 + h * b2;
+  accel(t1 + h * v1b, t2 + h * v2b, v1c, v2c);
+  const a3 = A1, b3 = A2;
+
+  const v1d = w1 + DT * a3, v2d = w2 + DT * b3;
+  accel(t1 + DT * v1c, t2 + DT * v2c, v1d, v2d);
+  const a4 = A1, b4 = A2;
+
+  th1[i] = t1 + DT / 6 * (w1 + 2 * v1b + 2 * v1c + v1d);
+  th2[i] = t2 + DT / 6 * (w2 + 2 * v2b + 2 * v2c + v2d);
+  om1[i] = w1 + DT / 6 * (a1 + 2 * a2 + 2 * a3 + a4);
+  om2[i] = w2 + DT / 6 * (b1 + 2 * b2 + 2 * b3 + b4);
+}
+
+// Toplam mekanik enerji; potansiyel sıfırı en alt konumda.
+function energy(i) {
+  const t1 = th1[i], t2 = th2[i], w1 = om1[i], w2 = om2[i];
+  const T = 0.5 * M1 * L1 * L1 * w1 * w1
+          + 0.5 * M2 * (L1 * L1 * w1 * w1 + L2 * L2 * w2 * w2
+                        + 2 * L1 * L2 * w1 * w2 * Math.cos(t1 - t2));
+  const y1 = L1 * (1 - Math.cos(t1));
+  const y2 = y1 + L2 * (1 - Math.cos(t2));
+  return T + M1 * G * y1 + M2 * G * y2;
+}
+function totalEnergy() { let s = 0; for (let i = 0; i < N; i++) s += energy(i); return s; }
+
+// ---------- İzler ----------
+const trail = new Float32Array(N * TRAIL * 2);
+let head = 0, count = 0;
+
+function tip(i) {
+  return [L1 * Math.sin(th1[i]) + L2 * Math.sin(th2[i]),
+          L1 * Math.cos(th1[i]) + L2 * Math.cos(th2[i])];
+}
+function recordTrail() {
+  for (let i = 0; i < N; i++) {
+    const [x, y] = tip(i), k = (i * TRAIL + head) * 2;
+    trail[k] = x; trail[k + 1] = y;
+  }
+  head = (head + 1) % TRAIL;
+  if (count < TRAIL) count++;
+}
+
+// ---------- Başlatma ----------
+function reset() {
+  // Kaotik bölgede rastgele başlangıç: iki kol da yatayın epey üzerinde.
+  const s = Math.random() < 0.5 ? -1 : 1;
+  init1 = s * Math.PI * (0.55 + Math.random() * 0.4);
+  init2 = (Math.random() < 0.5 ? -1 : 1) * Math.PI * (0.5 + Math.random() * 0.45);
+  for (let i = 0; i < N; i++) {
+    th1[i] = init1 + i * EPS;
+    th2[i] = init2 + i * EPS;
+    om1[i] = 0; om2[i] = 0;
+  }
+  simTime = 0; acc = 0; head = 0; count = 0;
+  E0 = totalEnergy();
+  recordTrail();
+  document.getElementById("init").textContent =
+    `θ₁ ${(init1 * 180 / Math.PI).toFixed(1)}°  θ₂ ${(init2 * 180 / Math.PI).toFixed(1)}°`;
+}
+
+// ---------- Çizim ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1, scale = 1, px = 0, py = 0, bg = null;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  scale = Math.min(W, H) * 0.215;
+  px = W / 2; py = H * 0.47;
+  bg = ctx.createRadialGradient(px, py, 0, px, py, Math.max(W, H) * 0.75);
+  bg.addColorStop(0, "#10121c");
+  bg.addColorStop(0.55, "#07080e");
+  bg.addColorStop(1, "#020206");
+}
+addEventListener("resize", resize);
+
+const CHUNKS = 10;
+const hues = Array.from({ length: N }, (_, i) => (i / (N - 1)) * 300 - 10);
+const trailStyle = hues.map(h =>
+  Array.from({ length: CHUNKS }, (_, k) => {
+    const a = Math.pow((k + 1) / CHUNKS, 1.6) * 0.55;
+    return `hsla(${h},95%,62%,${a.toFixed(3)})`;
+  }));
+const rodStyle = hues.map(h => `hsla(${h},70%,70%,0.22)`);
+const bobStyle = hues.map(h => `hsl(${h},100%,68%)`);
+
+function draw() {
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Erişim alanı çemberi
+  ctx.strokeStyle = "rgba(255,255,255,0.035)";
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(px, py, (L1 + L2) * scale, 0, Math.PI * 2); ctx.stroke();
+
+  ctx.globalCompositeOperation = "lighter";
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+
+  // İzler: eskiden yeniye, parçalara bölünüp giderek parlayan
+  ctx.lineWidth = 1.4;
+  const per = Math.ceil(TRAIL / CHUNKS);
+  for (let i = 0; i < N; i++) {
+    const base = i * TRAIL;
+    // j: en eskiden (0) en yeniye (count-1); parlaklık yaşa (TRAIL'e göre) bağlı
+    const offset = TRAIL - count;
+    for (let c = 0; c < CHUNKS; c++) {
+      const s = Math.max(c * per - offset, 0);
+      const e = Math.min((c + 1) * per - offset, count - 1);
+      if (e - s < 1) continue;
+      ctx.strokeStyle = trailStyle[i][c];
+      ctx.beginPath();
+      for (let j = s; j <= e; j++) {
+        const k = (base + (head - count + j + TRAIL) % TRAIL) * 2;
+        const x = px + trail[k] * scale, y = py + trail[k + 1] * scale;
+        j === s ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  }
+
+  // Çubuklar
+  ctx.lineWidth = 1.6;
+  for (let i = 0; i < N; i++) {
+    const x1 = px + L1 * Math.sin(th1[i]) * scale, y1 = py + L1 * Math.cos(th1[i]) * scale;
+    const x2 = x1 + L2 * Math.sin(th2[i]) * scale, y2 = y1 + L2 * Math.cos(th2[i]) * scale;
+    ctx.strokeStyle = rodStyle[i];
+    ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+
+  // Kütleler
+  ctx.shadowBlur = 12;
+  for (let i = 0; i < N; i++) {
+    const x1 = px + L1 * Math.sin(th1[i]) * scale, y1 = py + L1 * Math.cos(th1[i]) * scale;
+    const x2 = x1 + L2 * Math.sin(th2[i]) * scale, y2 = y1 + L2 * Math.cos(th2[i]) * scale;
+    ctx.fillStyle = ctx.shadowColor = bobStyle[i];
+    ctx.globalAlpha = 0.25;
+    ctx.beginPath(); ctx.arc(x1, y1, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 0.6;
+    ctx.beginPath(); ctx.arc(x2, y2, 3.2, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+
+  // Pivot
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "#e9ecf5";
+  ctx.beginPath(); ctx.arc(px, py, 3.5, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "rgba(233,236,245,0.25)";
+  ctx.beginPath(); ctx.arc(px, py, 8, 0, Math.PI * 2); ctx.stroke();
+}
+
+// ---------- HUD ----------
+const elT = document.getElementById("t"), elE = document.getElementById("e");
+const elDE = document.getElementById("de"), elSP = document.getElementById("sp");
+const elState = document.getElementById("state");
+
+function spread() {
+  // Uç noktaların ortalamadan RMS uzaklığı (m)
+  let mx = 0, my = 0;
+  const pts = [];
+  for (let i = 0; i < N; i++) { const p = tip(i); pts.push(p); mx += p[0]; my += p[1]; }
+  mx /= N; my /= N;
+  let s = 0;
+  for (const [x, y] of pts) s += (x - mx) ** 2 + (y - my) ** 2;
+  return Math.sqrt(s / N);
+}
+
+function hud() {
+  const E = totalEnergy(), rel = (E - E0) / E0, sp = spread();
+  elT.textContent = simTime.toFixed(2) + " s";
+  elE.textContent = E.toFixed(6) + " J";
+  elDE.textContent = (rel >= 0 ? "+" : "") + rel.toExponential(2);
+  elSP.textContent = sp < 1e-3 ? (sp * 1e6).toFixed(2) + " µm" :
+                     sp < 0.1  ? (sp * 1e3).toFixed(2) + " mm" : sp.toFixed(3) + " m";
+  let st, col;
+  if (sp < 1e-3)      { st = "senkron";   col = "#8f96ad"; }
+  else if (sp < 0.15) { st = "ayrışıyor"; col = "#f0c674"; }
+  else                { st = "kaos";      col = "#ff6b8b"; }
+  if (elState.textContent !== st) {
+    elState.textContent = st; elState.style.color = col; elState.style.borderColor = col + "55";
+  }
+}
+
+// ---------- Döngü ----------
+let last = performance.now(), hudTimer = 0;
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);  // sekme geçişlerinde sıçramayı engelle
+  last = now;
+  acc += dt;
+  while (acc >= DT) {
+    for (let i = 0; i < N; i++) step(i);
+    simTime += DT; acc -= DT;
+  }
+  recordTrail();
+  draw();
+  if ((hudTimer += dt) > 0.08) { hud(); hudTimer = 0; }
+  requestAnimationFrame(frame);
+}
+
+addEventListener("pointerdown", reset);
+resize();
+reset();
+hud();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
